@@ -1,0 +1,92 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from splinter.cli import main
+
+
+
+def test_splitall_splits_one_file(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "import math\n\n"
+        "def area(r):\n"
+        "    return math.pi * r * r\n\n"
+        "def hello(name):\n"
+        "    return f'Hello, {name}'\n\n"
+        "def orchestrate(r, name):\n"
+        "    return area(r), hello(name)\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["splitall", "main.py", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "from modules import area, hello, orchestrate" in updated
+
+    init_text = (tmp_path / "modules" / "__init__.py").read_text(encoding="utf-8")
+    assert "from .area import area" in init_text
+    assert "from .hello import hello" in init_text
+    assert "from .orchestrate import orchestrate" in init_text
+
+    output = capsys.readouterr().out
+    assert "Split 3 function(s)." in output
+
+
+
+def test_splitall_splits_python_files_in_directory(tmp_path: Path, capsys) -> None:
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "alpha.py").write_text(
+        "def alpha():\n"
+        "    return 'a'\n",
+        encoding="utf-8",
+    )
+    (pkg / "beta.py").write_text(
+        "def beta():\n"
+        "    return 'b'\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["splitall", "--dir", "pkg", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    assert "from modules import alpha" in (pkg / "alpha.py").read_text(encoding="utf-8")
+    assert "from modules import beta" in (pkg / "beta.py").read_text(encoding="utf-8")
+
+    init_text = (pkg / "modules" / "__init__.py").read_text(encoding="utf-8")
+    assert "from .alpha import alpha" in init_text
+    assert "from .beta import beta" in init_text
+
+    output = capsys.readouterr().out
+    assert "Split 2 function(s)." in output
+
+
+
+def test_splitall_generated_modules_use_direct_submodule_imports(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "from functools import wraps\n\n"
+        "def log_call(func):\n"
+        "    @wraps(func)\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n\n"
+        "def require_positive_numbers(values):\n"
+        "    if any(v < 0 for v in values):\n"
+        "        raise ValueError('negative values are not allowed')\n\n"
+        "@log_call\n"
+        "def compute(values):\n"
+        "    require_positive_numbers(values)\n"
+        "    return sum(values)\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["splitall", "main.py", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    compute_module = (tmp_path / "modules" / "compute.py").read_text(encoding="utf-8")
+    assert "from modules.log_call import log_call" in compute_module
+    assert "from modules.require_positive_numbers import require_positive_numbers" in compute_module
+    assert "from modules import" not in compute_module

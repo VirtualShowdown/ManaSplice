@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "Splinter"
+version = "0.1.0"
+description = "Split top-level Python functions into dedicated modules and rewire imports automatically."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "VirtualShowdown" }]
+requires-python = ">=3.12"
+dependencies = ["pytest>=9.0.3"]
+
+[project.scripts]
+Splinter = "splinter.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/splinter"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
