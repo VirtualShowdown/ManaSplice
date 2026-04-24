@@ -1,0 +1,52 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Test, build, and publish
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Run tests
+        run: uv run python -m pytest tests --basetemp .pytest_tmp
+
+      - name: Run lint
+        run: uv run ruff check src tests
+
+      - name: Run type checks
+        run: uv run mypy
+
+      - name: Compile Python files
+        run: uv run python -m compileall -q src tests examples
+
+      - name: Build package
+        run: uv build
+
+      - name: Publish package
+        run: uv publish --trusted-publishing always
