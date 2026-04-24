@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import ast
 import difflib
+from collections.abc import Sequence
 from pathlib import Path
 
-from .analysis import statement_start_lineno
+import libcst as cst
+from libcst.metadata import CodeRange, MetadataWrapper, PositionProvider
+
 from .exceptions import FunctionExtractionError
 from .models import FileChange
 
 
 def extract_lines(source_text: str, start_lineno: int, end_lineno: int) -> str:
-    lines = source_text.splitlines(keepends=True)
-    return "".join(lines[start_lineno - 1 : end_lineno])
+    module, positions = _module_with_top_level_positions(source_text)
+    for node, position in positions.items():
+        if isinstance(node, cst.FunctionDef) and _matches_ast_function_range(position, start_lineno, end_lineno):
+            return module.code_for_node(node)
+
+    raise FunctionExtractionError(f"Could not find a top-level function at lines {start_lineno}-{end_lineno}.")
 
 
 def build_import_block(
@@ -86,14 +93,26 @@ def remove_function_block(source_text: str, start_lineno: int, end_lineno: int) 
 
 
 def remove_function_blocks(source_text: str, ranges: list[tuple[int, int]]) -> str:
-    lines = source_text.splitlines(keepends=True)
-    for start, end in sorted(ranges, key=lambda item: item[0], reverse=True):
-        del lines[start - 1 : end]
+    module, positions = _module_with_top_level_positions(source_text)
+    ranges_to_remove = set(ranges)
+    updated_body: list[cst.BaseStatement] = []
+    removed_ranges: set[tuple[int, int]] = set()
 
-    updated = "".join(lines)
-    while "\n\n\n" in updated:
-        updated = updated.replace("\n\n\n", "\n\n")
-    return updated.lstrip("\n")
+    for stmt in module.body:
+        position = positions.get(stmt)
+        if isinstance(stmt, cst.FunctionDef) and position is not None:
+            matched_range = _matched_ast_range(position, ranges_to_remove)
+            if matched_range is not None:
+                removed_ranges.add(matched_range)
+                continue
+        updated_body.append(stmt)
+
+    missing_ranges = ranges_to_remove - removed_ranges
+    if missing_ranges:
+        formatted = ", ".join(f"{start}-{end}" for start, end in sorted(missing_ranges))
+        raise FunctionExtractionError(f"Could not remove top-level function range(s): {formatted}.")
+
+    return _normalize_rewritten_source(module.with_changes(body=updated_body).code)
 
 
 def compute_replacement_import(package_mode: bool, output_package: str, function_name: str) -> str:
@@ -110,38 +129,17 @@ def compute_group_import_statement(package_mode: bool, output_package: str, func
 
 
 def insert_import(source_text: str, import_statement: str) -> str:
-    lines = source_text.splitlines(keepends=True)
-    tree = ast.parse(source_text) if source_text.strip() else ast.parse("")
+    module = cst.parse_module(source_text)
+    import_node = _parse_simple_import(import_statement, module)
 
-    merged_source = _merge_with_existing_package_import(tree, lines, import_statement)
-    if merged_source is not None:
-        return merged_source
+    merged_module = _merge_with_existing_package_import(module, import_node)
+    if merged_module is not None:
+        return _normalize_rewritten_source(merged_module.code)
 
-    insert_after = 0
-    body = getattr(tree, "body", [])
-
-    if (
-        body
-        and isinstance(body[0], ast.Expr)
-        and isinstance(body[0].value, ast.Constant)
-        and isinstance(body[0].value.value, str)
-    ):
-        insert_after = body[0].end_lineno or 0
-
-    for stmt in body:
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            insert_after = max(insert_after, stmt.end_lineno or 0)
-
-    new_line = import_statement + "\n"
-
-    if insert_after == 0:
-        return new_line + ("\n" if source_text.strip() else "") + source_text
-
-    lines.insert(insert_after, new_line)
-    updated = "".join(lines)
-    while "\n\n\n" in updated:
-        updated = updated.replace("\n\n\n", "\n\n")
-    return updated
+    body: list[cst.BaseStatement] = list(module.body)
+    insert_at = _import_insert_index(body)
+    body.insert(insert_at, import_node)
+    return _normalize_rewritten_source(module.with_changes(body=body).code)
 
 
 def validate_output_package(output_package: str) -> None:
@@ -188,7 +186,7 @@ def _filter_import(stmt: ast.stmt, source_text: str, required_import_names: set[
     if not isinstance(stmt, (ast.Import, ast.ImportFrom)) or stmt.end_lineno is None:
         return None
     if isinstance(stmt, ast.ImportFrom) and any(alias.name == "*" for alias in stmt.names):
-        return extract_lines(source_text, stmt.lineno, stmt.end_lineno).rstrip()
+        return _extract_source_range(source_text, stmt.lineno, stmt.end_lineno).rstrip()
 
     kept = [alias for alias in stmt.names if _import_alias_bound_name(stmt, alias) in required_import_names]
     if not kept:
@@ -226,49 +224,6 @@ def _rewrite_package_import(import_text: str, package_mode: bool, output_package
     return rewritten
 
 
-def _merge_with_existing_package_import(
-    tree: ast.Module,
-    lines: list[str],
-    import_statement: str,
-) -> str | None:
-    parsed_import = ast.parse(import_statement).body[0]
-    if not isinstance(parsed_import, ast.ImportFrom) or parsed_import.module is None:
-        return None
-
-    body = getattr(tree, "body", [])
-    for stmt in body:
-        if not isinstance(stmt, ast.ImportFrom):
-            continue
-        if stmt.end_lineno is None:
-            continue
-        if stmt.level != parsed_import.level or stmt.module != parsed_import.module:
-            continue
-
-        imported_names = [alias.name for alias in stmt.names]
-        new_name = parsed_import.names[0].name
-        if new_name in imported_names:
-            return None
-
-        imported_names.append(new_name)
-        replacement = _format_import_from(stmt.level, stmt.module, imported_names)
-        start_lineno = statement_start_lineno(stmt)
-        lines[start_lineno - 1 : stmt.end_lineno] = [replacement]
-
-        updated = "".join(lines)
-        while "\n\n\n" in updated:
-            updated = updated.replace("\n\n\n", "\n\n")
-        return updated
-
-    return None
-
-
-def _format_import_from(level: int, module: str | None, names: list[str]) -> str:
-    prefix = "." * level
-    module_path = f"{prefix}{module or ''}"
-    unique_names = sorted(set(names))
-    return f"from {module_path} import {', '.join(unique_names)}\n"
-
-
 def _format_alias(alias: ast.alias) -> str:
     if alias.asname:
         return f"{alias.name} as {alias.asname}"
@@ -281,3 +236,144 @@ def _import_alias_bound_name(stmt: ast.Import | ast.ImportFrom, alias: ast.alias
     if isinstance(stmt, ast.Import):
         return alias.name.split(".", 1)[0]
     return alias.name
+
+
+def _module_with_top_level_positions(source_text: str) -> tuple[cst.Module, dict[cst.CSTNode, CodeRange]]:
+    wrapper = MetadataWrapper(cst.parse_module(source_text))
+    positions = wrapper.resolve(PositionProvider)
+    return wrapper.module, {stmt: positions[stmt] for stmt in wrapper.module.body if stmt in positions}
+
+
+def _matches_ast_function_range(position: CodeRange, start_lineno: int, end_lineno: int) -> bool:
+    return start_lineno <= position.start.line <= end_lineno and position.end.line == end_lineno
+
+
+def _matched_ast_range(position: CodeRange, ranges: set[tuple[int, int]]) -> tuple[int, int] | None:
+    for start_lineno, end_lineno in ranges:
+        if _matches_ast_function_range(position, start_lineno, end_lineno):
+            return start_lineno, end_lineno
+    return None
+
+
+def _parse_simple_import(import_statement: str, module: cst.Module) -> cst.SimpleStatementLine:
+    parsed = cst.parse_statement(import_statement + "\n", config=module.config_for_parsing)
+    if not isinstance(parsed, cst.SimpleStatementLine):
+        raise FunctionExtractionError(f"Replacement import is not a simple import: {import_statement}")
+    if len(parsed.body) != 1 or not isinstance(parsed.body[0], cst.ImportFrom):
+        raise FunctionExtractionError(f"Replacement import is not a from-import: {import_statement}")
+    return parsed
+
+
+def _merge_with_existing_package_import(
+    module: cst.Module,
+    import_node: cst.SimpleStatementLine,
+) -> cst.Module | None:
+    import_from = import_node.body[0]
+    if not isinstance(import_from, cst.ImportFrom) or not isinstance(import_from.names, Sequence):
+        return None
+
+    import_key = _import_from_key(import_from)
+    if import_key is None:
+        return None
+
+    new_alias = import_from.names[0]
+    if not isinstance(new_alias, cst.ImportAlias):
+        return None
+    new_name = _dotted_name_to_str(new_alias.name)
+
+    body = list(module.body)
+    for index, stmt in enumerate(body):
+        existing = _single_import_from(stmt)
+        if existing is None or _import_from_key(existing) != import_key:
+            continue
+        if not isinstance(existing.names, Sequence):
+            continue
+
+        existing_names = [_dotted_name_to_str(alias.name) for alias in existing.names]
+        if new_name in existing_names:
+            return None
+
+        replacement = _format_cst_import_from(existing, [*existing_names, new_name])
+        body[index] = cst.parse_statement(replacement, config=module.config_for_parsing)
+        return module.with_changes(body=body)
+
+    return None
+
+
+def _single_import_from(stmt: cst.BaseStatement) -> cst.ImportFrom | None:
+    if not isinstance(stmt, cst.SimpleStatementLine) or len(stmt.body) != 1:
+        return None
+    small_stmt = stmt.body[0]
+    if isinstance(small_stmt, cst.ImportFrom):
+        return small_stmt
+    return None
+
+
+def _import_from_key(node: cst.ImportFrom) -> tuple[int, str] | None:
+    module_name = _import_module_name(node)
+    if module_name is None:
+        return None
+    return (len(node.relative), module_name)
+
+
+def _import_module_name(node: cst.ImportFrom) -> str | None:
+    if node.module is None:
+        return ""
+    return _dotted_name_to_str(node.module)
+
+
+def _dotted_name_to_str(node: cst.BaseExpression) -> str:
+    if isinstance(node, cst.Name):
+        return node.value
+    if isinstance(node, cst.Attribute):
+        return f"{_dotted_name_to_str(node.value)}.{node.attr.value}"
+    raise FunctionExtractionError("Unsupported import name shape.")
+
+
+def _format_cst_import_from(node: cst.ImportFrom, names: list[str]) -> str:
+    module_name = _import_module_name(node)
+    if module_name is None:
+        raise FunctionExtractionError("Unsupported import statement shape.")
+    prefix = "." * len(node.relative)
+    unique_names = sorted(set(names))
+    return f"from {prefix}{module_name} import {', '.join(unique_names)}\n"
+
+
+def _import_insert_index(body: list[cst.BaseStatement]) -> int:
+    insert_at = 0
+    if body and _is_module_docstring(body[0]):
+        insert_at = 1
+
+    for index, stmt in enumerate(body):
+        if _single_import(stmt) is not None or _single_import_from(stmt) is not None:
+            insert_at = index + 1
+
+    return insert_at
+
+
+def _single_import(stmt: cst.BaseStatement) -> cst.Import | None:
+    if not isinstance(stmt, cst.SimpleStatementLine) or len(stmt.body) != 1:
+        return None
+    small_stmt = stmt.body[0]
+    if isinstance(small_stmt, cst.Import):
+        return small_stmt
+    return None
+
+
+def _is_module_docstring(stmt: cst.BaseStatement) -> bool:
+    if not isinstance(stmt, cst.SimpleStatementLine) or len(stmt.body) != 1:
+        return False
+    expr = stmt.body[0]
+    return isinstance(expr, cst.Expr) and isinstance(expr.value, cst.SimpleString)
+
+
+def _normalize_rewritten_source(source_text: str) -> str:
+    updated = source_text
+    while "\n\n\n" in updated:
+        updated = updated.replace("\n\n\n", "\n\n")
+    return updated.lstrip("\n")
+
+
+def _extract_source_range(source_text: str, start_lineno: int, end_lineno: int) -> str:
+    lines = source_text.splitlines(keepends=True)
+    return "".join(lines[start_lineno - 1 : end_lineno])
