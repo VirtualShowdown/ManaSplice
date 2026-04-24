@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "splinter"
+name = "manasplice"
 version = "0.1.0"
 description = "Split top-level Python functions into dedicated modules and rewire imports automatically."
 readme = "README.md"
@@ -13,17 +13,13 @@ requires-python = ">=3.12"
 dependencies = ["colorama>=0.4.6"]
 
 [project.scripts]
-splinter = "splinter.cli:main"
+manasplice = "manasplice.cli:main"
 
 [dependency-groups]
-dev = [
-    "mypy>=1.18.0",
-    "pytest>=9.0.3",
-    "ruff>=0.14.0",
-]
+dev = ["mypy>=1.18.0", "pytest>=9.0.3", "ruff>=0.14.0"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/splinter"]
+packages = ["src/manasplice"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -37,7 +33,7 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.mypy]
 python_version = "3.12"
-files = ["src/splinter"]
+files = ["src/manasplice"]
 check_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true

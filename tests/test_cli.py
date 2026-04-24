@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from splinter.cli import main
+from manasplice.cli import main
 
 
 def test_splitall_splits_one_file(tmp_path: Path, capsys) -> None:
@@ -239,7 +239,7 @@ def test_splitfunc_validate_rejects_invalid_generated_output(tmp_path: Path, mon
         del import_statement
         return source_text + "\nthis is not valid python(\n"
 
-    monkeypatch.setattr("splinter.splitter._insert_import", broken_insert_import)
+    monkeypatch.setattr("manasplice.splitter._insert_import", broken_insert_import)
 
     exit_code = main(["splitfunc", "main.area", "--cwd", str(tmp_path), "--validate"])
 
@@ -262,7 +262,7 @@ def test_undo_rolls_back_last_splitfunc_operation(tmp_path: Path, capsys) -> Non
 
     assert split_exit == 0
     assert (tmp_path / "modules" / "area.py").exists()
-    history_file = tmp_path / ".splinter_history.json"
+    history_file = tmp_path / ".manasplice_history.json"
     history = json.loads(history_file.read_text(encoding="utf-8"))
     assert len(history) == 1
 
@@ -292,7 +292,7 @@ def test_undo_rolls_back_splitall_as_one_operation(tmp_path: Path, capsys) -> No
     split_exit = main(["splitall", "main.py", "--cwd", str(tmp_path)])
 
     assert split_exit == 0
-    history_file = tmp_path / ".splinter_history.json"
+    history_file = tmp_path / ".manasplice_history.json"
     history = json.loads(history_file.read_text(encoding="utf-8"))
     assert len(history) == 1
 

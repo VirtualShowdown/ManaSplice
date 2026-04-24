@@ -8,7 +8,7 @@ from .exceptions import PySplitError
 from .models import FileChange, GroupSplitResult, SplitResult
 from .utils import write_text_preserving_newlines
 
-HISTORY_FILENAME = ".splinter_history.json"
+HISTORY_FILENAME = ".manasplice_history.json"
 
 
 @dataclass(slots=True)

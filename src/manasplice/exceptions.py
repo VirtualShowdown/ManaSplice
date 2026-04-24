@@ -1,5 +1,5 @@
 class PySplitError(Exception):
-    """Base exception for Splinter."""
+    """Base exception for ManaSplice."""
 
 
 class TargetResolutionError(PySplitError):

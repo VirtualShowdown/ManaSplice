@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def load_project_config(cwd: Path) -> dict:
-    """Load [tool.splinter] from the nearest pyproject.toml above cwd, or return {}."""
+    """Load [tool.manasplice] from the nearest pyproject.toml above cwd, or return {}."""
     pyproject = _find_pyproject(cwd.resolve())
     if pyproject is None:
         return {}
@@ -14,7 +14,7 @@ def load_project_config(cwd: Path) -> dict:
             data = tomllib.load(fh)
     except Exception:
         return {}
-    return data.get("tool", {}).get("splinter", {})
+    return data.get("tool", {}).get("manasplice", {})
 
 
 def _find_pyproject(start: Path) -> Path | None:

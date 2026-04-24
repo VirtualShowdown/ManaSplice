@@ -1,4 +1,4 @@
-"""Splinter package."""
+"""ManaSplice package."""
 
 from .splitter import split_function
 

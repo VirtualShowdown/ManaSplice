@@ -30,7 +30,7 @@ just_fix_windows_console()
 def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     config = config or {}
     parser = argparse.ArgumentParser(
-        prog="splinter",
+        prog="manasplice",
         description="Split a top-level Python function into its own module and rewrite imports.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -291,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Updated rollback history: {history_file}")
             return 0
     except PySplitError as exc:
-        print(f"Splinter error: {exc}")
+        print(f"ManaSplice error: {exc}")
         return 1
 
     parser.print_help()
