@@ -104,6 +104,69 @@ def test_splitall_generated_modules_use_direct_submodule_imports(tmp_path: Path)
     assert "from modules import" not in compute_module
 
 
+def test_splitall_auto_group_keeps_related_functions_together(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "def parse_value(raw):\n"
+        "    return raw.strip()\n\n"
+        "def validate_value(value):\n"
+        "    if not value:\n"
+        "        raise ValueError('missing value')\n"
+        "    return value\n\n"
+        "def format_value(raw):\n"
+        "    value = parse_value(raw)\n"
+        "    return validate_value(value).upper()\n\n"
+        "def unrelated():\n"
+        "    return 42\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["splitall", "main.py", "--cwd", str(tmp_path), "--auto-group"])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "from modules import format_value, parse_value, unrelated, validate_value" in updated
+    assert "def format_value" not in updated
+    assert "def unrelated" not in updated
+
+    grouped_module = (tmp_path / "modules" / "parse_value.py").read_text(encoding="utf-8")
+    assert "def parse_value(raw):" in grouped_module
+    assert "def validate_value(value):" in grouped_module
+    assert "def format_value(raw):" in grouped_module
+    assert not (tmp_path / "modules" / "format_value.py").exists()
+    assert (tmp_path / "modules" / "unrelated.py").exists()
+
+    init_text = (tmp_path / "modules" / "__init__.py").read_text(encoding="utf-8")
+    assert "from .parse_value import format_value, parse_value, validate_value" in init_text
+    assert "from .unrelated import unrelated" in init_text
+
+    output = capsys.readouterr().out
+    assert "Split related group ['parse_value', 'validate_value', 'format_value'] -> parse_value.py" in output
+    assert "Split 4 function(s)." in output
+
+
+def test_check_recommends_auto_group_for_related_functions(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = (
+        "def parse_value(raw):\n"
+        "    return raw.strip()\n\n"
+        "def format_value(raw):\n"
+        "    return parse_value(raw).upper()\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["check", "main.py", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    assert source.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "modules").exists()
+
+    output = capsys.readouterr().out
+    assert "Related functions detected:" in output
+    assert "parse_value, format_value" in output
+    assert "Recommendation: use --auto-group to keep related functions together." in output
+
+
 def test_splitall_preview_does_not_write_files(tmp_path: Path, capsys) -> None:
     source = tmp_path / "main.py"
     original = "def area(r):\n    return r * r\n\ndef hello(name):\n    return f'Hello, {name}'\n"

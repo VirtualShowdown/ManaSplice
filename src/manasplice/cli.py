@@ -129,6 +129,14 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         ),
     )
     splitall.add_argument(
+        "--auto-group",
+        action="store_true",
+        help=(
+            "Automatically group related functions into shared module files when they "
+            "reference each other."
+        ),
+    )
+    splitall.add_argument(
         "--force",
         action="store_true",
         help="Replace existing generated modules if output paths already exist.",
@@ -140,6 +148,7 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         include=config.get("include"),
         exclude=config.get("exclude"),
         related=config.get("related", False),
+        auto_group=config.get("auto_group", False),
     )
 
     check = subparsers.add_parser(
@@ -190,6 +199,11 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         help="Check related functions as grouped output modules.",
     )
     check.add_argument(
+        "--auto-group",
+        action="store_true",
+        help="Automatically check related functions as grouped output modules.",
+    )
+    check.add_argument(
         "--force",
         action="store_true",
         help="Allow checks to pass when an output module already exists.",
@@ -201,6 +215,7 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         include=config.get("include"),
         exclude=config.get("exclude"),
         related=config.get("related", False),
+        auto_group=config.get("auto_group", False),
     )
 
     undo = subparsers.add_parser(
@@ -259,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
                 include_patterns=_parse_patterns(args.include),
                 exclude_patterns=_parse_patterns(args.exclude),
                 public_only=args.public_only,
-                related=args.related,
+                auto_group=args.auto_group or args.related,
             )
             if split_count == 0:
                 print("No top-level functions found.")
@@ -278,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
                 include_patterns=_parse_patterns(args.include),
                 exclude_patterns=_parse_patterns(args.exclude),
                 public_only=args.public_only,
-                related=args.related,
+                auto_group=args.auto_group or args.related,
             )
             if check_count == 0:
                 print("Check passed: no top-level functions found.")
@@ -307,7 +322,7 @@ def _split_all(
     include_patterns: list[str],
     exclude_patterns: list[str],
     public_only: bool,
-    related: bool = False,
+    auto_group: bool = False,
     show_diffs: bool = True,
 ) -> int:
     target_files = _resolve_splitall_files(path_arg, directory_arg, cwd)
@@ -322,7 +337,7 @@ def _split_all(
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
             public_only=public_only,
-            related=related,
+            auto_group=auto_group,
             show_diffs=show_diffs,
         )
         results.extend(file_results)
@@ -345,7 +360,7 @@ def _check(
     include_patterns: list[str],
     exclude_patterns: list[str],
     public_only: bool,
-    related: bool,
+    auto_group: bool,
 ) -> int:
     if directory_arg or _looks_like_file_path(target_or_path):
         return _split_all(
@@ -356,7 +371,7 @@ def _check(
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
             public_only=public_only,
-            related=related,
+            auto_group=auto_group,
             show_diffs=False,
         )
 
@@ -398,7 +413,7 @@ def _split_all_in_file(
     include_patterns: list[str],
     exclude_patterns: list[str],
     public_only: bool,
-    related: bool = False,
+    auto_group: bool = False,
     show_diffs: bool = True,
 ) -> list[SplitResult | GroupSplitResult]:
     function_names = _list_top_level_function_names(
@@ -409,8 +424,10 @@ def _split_all_in_file(
     )
     module_path = _module_path_from_file(file_path, cwd)
     results: list[SplitResult | GroupSplitResult] = []
+    groups = _find_related_function_groups(file_path, function_names)
 
-    if not related:
+    if not auto_group:
+        _print_auto_group_recommendations(groups)
         for function_name in function_names:
             spec = TargetSpec(module_path=module_path, function_name=function_name)
             resolved = resolve_target(spec, cwd=cwd)
@@ -421,10 +438,6 @@ def _split_all_in_file(
             print(f"Created: {result.new_module_file}")
             print(f"Inserted import: {result.import_statement}")
         return results
-
-    # --related: group functions by mutual references before splitting.
-    source_text = read_python_source(file_path)
-    groups = build_function_call_groups(source_text, function_names, file_path)
 
     for group in groups:
         if len(group) == 1:
@@ -446,6 +459,22 @@ def _split_all_in_file(
             _print_group_result(group_result, show_diffs=show_diffs)
 
     return results
+
+
+def _find_related_function_groups(file_path: Path, function_names: list[str]) -> list[list[str]]:
+    source_text = read_python_source(file_path)
+    return build_function_call_groups(source_text, function_names, file_path)
+
+
+def _print_auto_group_recommendations(groups: list[list[str]]) -> None:
+    related_groups = [group for group in groups if len(group) > 1]
+    if not related_groups:
+        return
+
+    print("Related functions detected:")
+    for group in related_groups:
+        print(f"  {', '.join(group)}")
+    print("Recommendation: use --auto-group to keep related functions together.")
 
 
 def _list_top_level_function_names(

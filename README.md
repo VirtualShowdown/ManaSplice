@@ -97,6 +97,7 @@ manasplice splitfunc <module>.<function> --preview
 manasplice splitall <path/to/file.py> --preview
 manasplice splitfunc <module>.<function> --validate
 manasplice splitall <path/to/file.py> --public-only --exclude main,_*
+manasplice splitall <path/to/file.py> --auto-group
 manasplice splitfunc <module>.<function> --output-package generated
 manasplice splitfunc <module>.<function> --force
 ```
@@ -112,6 +113,7 @@ uv run manasplice check main.area
 uv run manasplice check main.py --public-only --exclude main,_*
 uv run manasplice splitall main.py --preview
 uv run manasplice splitall main.py --public-only --exclude main,_*
+uv run manasplice splitall main.py --auto-group
 uv run manasplice splitfunc main.area --validate
 uv run manasplice splitfunc main.area --output-package generated
 uv run manasplice undo
@@ -125,6 +127,7 @@ uv run manasplice undo
 - Use `--preview` to inspect planned edits with a safety report and unified diffs before ManaSplice writes anything.
 - Use `--validate` to make ManaSplice parse the generated Python source before it writes changes.
 - Use `--include`, `--exclude`, and `--public-only` to make `splitall` selective instead of splitting every top-level function.
+- Use `--auto-group` to keep top-level functions that reference each other in the same generated module.
 - Use `--output-package` if you want generated modules somewhere other than `modules/`.
 - ManaSplice refuses to overwrite an existing generated module unless you pass `--force`.
 - ManaSplice refuses splits that depend on mutable top-level globals, because copying those globals into a new module changes runtime state.
