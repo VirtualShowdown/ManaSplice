@@ -1,8 +1,10 @@
-# ManaSplice
+![image](media/icons/manasplit_tp.png)
 
-ManaSplice is a small CLI for pulling top-level Python functions into their own files without leaving the original module broken.
-
-It creates a `modules/` package next to the source file, moves the function there, and rewrites the source module to import it back in.
+> # ManaSplice
+>
+> ManaSplice is a small CLI for pulling top-level Python functions into their own files without leaving the original module broken.
+>
+> It creates a `modules/` package next to the source file, moves the function there, and rewrites the source module to import it back in.
 
 ## What it does
 
@@ -142,6 +144,6 @@ uv run mypy
 
 ## _CONTRIBUTION_
 
-<b>
-Feel free to give feedback and/or suggest changes. This is just meant to be a helpful tool for larger projects made for fun.
-</b>
+> <b>
+> Feel free to give feedback and/or suggest changes. This is just meant to be a helpful tool for larger projects made for fun.
+> </b>
