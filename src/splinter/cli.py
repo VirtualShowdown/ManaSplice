@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import ast
 import argparse
+import ast
 import fnmatch
 import os
 import sys
@@ -13,17 +13,23 @@ from .config import load_project_config
 from .exceptions import PySplitError
 from .history import record_split_history, rollback_last
 from .resolver import TargetSpec, parse_target, resolve_target
-from .splitter import GroupSplitResult, SplitOptions, build_function_call_groups, split_function, split_group
-from .utils import path_to_module_parts
+from .splitter import (
+    GroupSplitResult,
+    SplitOptions,
+    SplitResult,
+    build_function_call_groups,
+    split_function,
+    split_group,
+)
+from .utils import path_to_module_parts, read_python_source
 
 just_fix_windows_console()
-
 
 
 def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     config = config or {}
     parser = argparse.ArgumentParser(
-        prog="Splinter",
+        prog="splinter",
         description="Split a top-level Python function into its own module and rewrite imports.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -55,6 +61,11 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         "--output-package",
         default="modules",
         help="Package name to create extracted modules in. Defaults to 'modules'.",
+    )
+    splitfunc.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing generated module if the output path already exists.",
     )
     splitfunc.set_defaults(
         output_package=config.get("output_package", "modules"),
@@ -116,6 +127,11 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
             "instead of splitting each function into its own file."
         ),
     )
+    splitall.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace existing generated modules if output paths already exist.",
+    )
     splitall.set_defaults(
         output_package=config.get("output_package", "modules"),
         validate=config.get("validate", False),
@@ -143,7 +159,6 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     )
 
     return parser
-
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -203,7 +218,6 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
-
 def _split_all(
     path_arg: str | None,
     directory_arg: str | None,
@@ -217,7 +231,7 @@ def _split_all(
 ) -> int:
     target_files = _resolve_splitall_files(path_arg, directory_arg, cwd)
     split_count = 0
-    results = []
+    results: list[SplitResult | GroupSplitResult] = []
 
     for file_path in target_files:
         file_results = _split_all_in_file(
@@ -230,10 +244,7 @@ def _split_all(
             related=related,
         )
         results.extend(file_results)
-        split_count += sum(
-            len(r.function_names) if isinstance(r, GroupSplitResult) else 1
-            for r in file_results
-        )
+        split_count += sum(len(r.function_names) if isinstance(r, GroupSplitResult) else 1 for r in file_results)
 
     if results and not options.preview:
         descriptor = path_arg if path_arg else f"--dir {directory_arg}"
@@ -241,7 +252,6 @@ def _split_all(
         print(f"Recorded rollback history: {history_file}")
 
     return split_count
-
 
 
 def _resolve_splitall_files(path_arg: str | None, directory_arg: str | None, cwd: Path) -> list[Path]:
@@ -253,11 +263,7 @@ def _resolve_splitall_files(path_arg: str | None, directory_arg: str | None, cwd
         if not directory.exists() or not directory.is_dir():
             raise PySplitError(f"Directory not found: {directory}")
 
-        return sorted(
-            file_path
-            for file_path in directory.glob("*.py")
-            if file_path.name != "__init__.py"
-        )
+        return sorted(file_path for file_path in directory.glob("*.py") if file_path.name != "__init__.py")
 
     file_path = (cwd / (path_arg or "")).resolve()
     if not file_path.exists() or not file_path.is_file():
@@ -266,7 +272,6 @@ def _resolve_splitall_files(path_arg: str | None, directory_arg: str | None, cwd
         raise PySplitError(f"splitall only supports Python files: {file_path}")
 
     return [file_path]
-
 
 
 def _split_all_in_file(
@@ -286,7 +291,7 @@ def _split_all_in_file(
         public_only=public_only,
     )
     module_path = _module_path_from_file(file_path, cwd)
-    results = []
+    results: list[SplitResult | GroupSplitResult] = []
 
     if not related:
         for function_name in function_names:
@@ -301,7 +306,7 @@ def _split_all_in_file(
         return results
 
     # --related: group functions by mutual references before splitting.
-    source_text = file_path.read_text(encoding="utf-8")
+    source_text = read_python_source(file_path)
     groups = build_function_call_groups(source_text, function_names, file_path)
 
     for group in groups:
@@ -319,12 +324,11 @@ def _split_all_in_file(
             primary = group[0]
             spec = TargetSpec(module_path=module_path, function_name=primary)
             resolved = resolve_target(spec, cwd=cwd)
-            result = split_group(resolved, group, options=options)
-            results.append(result)
-            _print_group_result(result)
+            group_result = split_group(resolved, group, options=options)
+            results.append(group_result)
+            _print_group_result(group_result)
 
     return results
-
 
 
 def _list_top_level_function_names(
@@ -335,15 +339,11 @@ def _list_top_level_function_names(
     public_only: bool,
 ) -> list[str]:
     try:
-        tree = ast.parse(file_path.read_text(encoding="utf-8"))
+        tree = ast.parse(read_python_source(file_path))
     except SyntaxError as exc:
         raise PySplitError(f"Could not parse '{file_path}': {exc}") from exc
 
-    function_names = [
-        stmt.name
-        for stmt in tree.body
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
+    function_names = [stmt.name for stmt in tree.body if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))]
 
     if public_only:
         function_names = [name for name in function_names if not name.startswith("_")]
@@ -353,20 +353,19 @@ def _list_top_level_function_names(
         ]
     if exclude_patterns:
         function_names = [
-            name for name in function_names if not any(fnmatch.fnmatchcase(name, pattern) for pattern in exclude_patterns)
+            name
+            for name in function_names
+            if not any(fnmatch.fnmatchcase(name, pattern) for pattern in exclude_patterns)
         ]
 
     return function_names
-
 
 
 def _module_path_from_file(file_path: Path, cwd: Path) -> str:
     try:
         return ".".join(path_to_module_parts(file_path, cwd.resolve()))
     except ValueError as exc:
-        raise PySplitError(
-            f"File '{file_path}' is not inside the configured cwd '{cwd.resolve()}'."
-        ) from exc
+        raise PySplitError(f"File '{file_path}' is not inside the configured cwd '{cwd.resolve()}'.") from exc
 
 
 def _print_split_result(result) -> None:
@@ -383,7 +382,7 @@ def _print_group_result(result: GroupSplitResult) -> None:
     action = "Would split" if result.preview else "Split"
     verb = _color_text(action, Fore.CYAN if result.preview else Fore.GREEN)
     names_str = _color_text(", ".join(f"'{n}'" for n in result.function_names), Fore.MAGENTA)
-    print(f"{verb} related group [{names_str}] → {result.new_module_file.name}")
+    print(f"{verb} related group [{names_str}] -> {result.new_module_file.name}")
     if result.preview:
         for diff in result.preview_diffs:
             _print_preview_diff(diff)
@@ -405,6 +404,7 @@ def _build_split_options(args: argparse.Namespace) -> SplitOptions:
         preview=args.preview,
         output_package=args.output_package,
         validate=args.validate,
+        force=args.force,
     )
 
 

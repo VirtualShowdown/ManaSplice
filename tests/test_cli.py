@@ -6,7 +6,6 @@ from pathlib import Path
 from splinter.cli import main
 
 
-
 def test_splitall_splits_one_file(tmp_path: Path, capsys) -> None:
     source = tmp_path / "main.py"
     source.write_text(
@@ -35,18 +34,31 @@ def test_splitall_splits_one_file(tmp_path: Path, capsys) -> None:
     assert "Split 3 function(s)." in output
 
 
+def test_splitall_handles_utf8_bom_source_files(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "def area(r):\n"
+        "    return r * r\n",
+        encoding="utf-8-sig",
+    )
+
+    exit_code = main(["splitall", "main.py", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    assert "from modules import area" in source.read_text(encoding="utf-8")
+    output = capsys.readouterr().out
+    assert "Split 1 function(s)." in output
+
 
 def test_splitall_splits_python_files_in_directory(tmp_path: Path, capsys) -> None:
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     (pkg / "alpha.py").write_text(
-        "def alpha():\n"
-        "    return 'a'\n",
+        "def alpha():\n    return 'a'\n",
         encoding="utf-8",
     )
     (pkg / "beta.py").write_text(
-        "def beta():\n"
-        "    return 'b'\n",
+        "def beta():\n    return 'b'\n",
         encoding="utf-8",
     )
 
@@ -62,7 +74,6 @@ def test_splitall_splits_python_files_in_directory(tmp_path: Path, capsys) -> No
 
     output = capsys.readouterr().out
     assert "Split 2 function(s)." in output
-
 
 
 def test_splitall_generated_modules_use_direct_submodule_imports(tmp_path: Path) -> None:
@@ -95,12 +106,7 @@ def test_splitall_generated_modules_use_direct_submodule_imports(tmp_path: Path)
 
 def test_splitall_preview_does_not_write_files(tmp_path: Path, capsys) -> None:
     source = tmp_path / "main.py"
-    original = (
-        "def area(r):\n"
-        "    return r * r\n\n"
-        "def hello(name):\n"
-        "    return f'Hello, {name}'\n"
-    )
+    original = "def area(r):\n    return r * r\n\ndef hello(name):\n    return f'Hello, {name}'\n"
     source.write_text(original, encoding="utf-8")
 
     exit_code = main(["splitall", "main.py", "--cwd", str(tmp_path), "--preview"])
@@ -160,8 +166,7 @@ def test_splitall_supports_include_exclude_and_public_only_filters(tmp_path: Pat
 def test_splitfunc_supports_custom_output_package(tmp_path: Path) -> None:
     source = tmp_path / "main.py"
     source.write_text(
-        "def area(r):\n"
-        "    return r * r\n",
+        "def area(r):\n    return r * r\n",
         encoding="utf-8",
     )
 
@@ -175,10 +180,7 @@ def test_splitfunc_supports_custom_output_package(tmp_path: Path) -> None:
 
 def test_splitfunc_validate_rejects_invalid_generated_output(tmp_path: Path, monkeypatch, capsys) -> None:
     source = tmp_path / "main.py"
-    original = (
-        "def area(r):\n"
-        "    return r * r\n"
-    )
+    original = "def area(r):\n    return r * r\n"
     source.write_text(original, encoding="utf-8")
 
     def broken_insert_import(source_text: str, import_statement: str) -> str:
@@ -200,11 +202,7 @@ def test_splitfunc_validate_rejects_invalid_generated_output(tmp_path: Path, mon
 def test_undo_rolls_back_last_splitfunc_operation(tmp_path: Path, capsys) -> None:
     source = tmp_path / "main.py"
     original = (
-        "import math\n\n"
-        "def area(r):\n"
-        "    return math.pi * r * r\n\n"
-        "def hello(name):\n"
-        "    return f'Hello, {name}'\n"
+        "import math\n\ndef area(r):\n    return math.pi * r * r\n\ndef hello(name):\n    return f'Hello, {name}'\n"
     )
     source.write_text(original, encoding="utf-8")
 
@@ -256,3 +254,16 @@ def test_undo_rolls_back_splitall_as_one_operation(tmp_path: Path, capsys) -> No
     output = capsys.readouterr().out
     assert "Split 3 function(s)." in output
     assert "Rolled back 1 operation(s)." in output
+
+
+def test_undo_preserves_original_line_endings(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    original = b"def one():\r\n    return 1\r\n\r\ndef two():\r\n    return 2"
+    source.write_bytes(original)
+
+    split_exit = main(["splitall", "main.py", "--cwd", str(tmp_path)])
+    undo_exit = main(["undo", "--cwd", str(tmp_path)])
+
+    assert split_exit == 0
+    assert undo_exit == 0
+    assert source.read_bytes() == original

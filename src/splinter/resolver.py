@@ -19,21 +19,15 @@ class ResolvedTarget:
     package_mode: bool
 
 
-
 def parse_target(target: str) -> TargetSpec:
     if "." not in target:
-        raise TargetResolutionError(
-            "Target must look like 'module.function' or 'package.module.function'."
-        )
+        raise TargetResolutionError("Target must look like 'module.function' or 'package.module.function'.")
 
     *module_parts, function_name = target.split(".")
     if not module_parts or not function_name:
-        raise TargetResolutionError(
-            "Target must include both a module path and a function name."
-        )
+        raise TargetResolutionError("Target must include both a module path and a function name.")
 
     return TargetSpec(module_path=".".join(module_parts), function_name=function_name)
-
 
 
 def resolve_target(spec: TargetSpec, cwd: Path | None = None) -> ResolvedTarget:
@@ -54,7 +48,6 @@ def resolve_target(spec: TargetSpec, cwd: Path | None = None) -> ResolvedTarget:
     raise TargetResolutionError(
         f"Could not find module '{spec.module_path}' from '{base}'. Expected '{candidate_py}' or '{candidate_pkg}'."
     )
-
 
 
 def _is_package_context(module_file: Path) -> bool:

@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .exceptions import PySplitError
-from .splitter import FileChange, GroupSplitResult, SplitResult
+from .models import FileChange, GroupSplitResult, SplitResult
+from .utils import write_text_preserving_newlines
 
 HISTORY_FILENAME = ".splinter_history.json"
 
@@ -96,7 +97,11 @@ def _serialize_entry(cwd: Path, entry: HistoryEntry) -> dict[str, object]:
 
 def _deserialize_entry(cwd: Path, data: dict[str, object]) -> HistoryEntry:
     changes: list[FileChange] = []
-    for change_data in data.get("changes", []):
+    raw_changes = data.get("changes", [])
+    if not isinstance(raw_changes, list):
+        raise PySplitError("Rollback history is corrupted.")
+
+    for change_data in raw_changes:
         if not isinstance(change_data, dict):
             raise PySplitError("Rollback history is corrupted.")
 
@@ -124,7 +129,7 @@ def _deserialize_entry(cwd: Path, data: dict[str, object]) -> HistoryEntry:
 def _restore_change(change: FileChange) -> None:
     if change.existed_before:
         change.path.parent.mkdir(parents=True, exist_ok=True)
-        change.path.write_text(change.before_text, encoding="utf-8")
+        write_text_preserving_newlines(change.path, change.before_text)
         return
 
     if change.path.exists():

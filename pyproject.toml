@@ -3,20 +3,42 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "Splinter"
+name = "splinter"
 version = "0.1.0"
 description = "Split top-level Python functions into dedicated modules and rewire imports automatically."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "VirtualShowdown" }]
 requires-python = ">=3.12"
-dependencies = ["colorama>=0.4.6", "pytest>=9.0.3"]
+dependencies = ["colorama>=0.4.6"]
 
 [project.scripts]
-Splinter = "splinter.cli:main"
+splinter = "splinter.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18.0",
+    "pytest>=9.0.3",
+    "ruff>=0.14.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/splinter"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/splinter"]
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+disable_error_code = ["import-untyped"]

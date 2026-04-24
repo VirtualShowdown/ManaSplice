@@ -25,6 +25,7 @@ dist/
 
 # Local verification and scratch directories
 .splitall_check/
+.splinter_history.json
 verification_*/
 
 # Generated example runtime data

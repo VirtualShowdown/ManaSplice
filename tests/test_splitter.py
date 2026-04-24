@@ -4,20 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from splinter.resolver import parse_target, resolve_target
 from splinter.exceptions import FunctionExtractionError
+from splinter.resolver import parse_target, resolve_target
 from splinter.splitter import split_function
-
 
 
 def test_split_function_in_simple_script(tmp_path: Path) -> None:
     source = tmp_path / "main.py"
     source.write_text(
-        "import math\n\n"
-        "def area(r):\n"
-        "    return math.pi * r * r\n\n"
-        "def hello(name):\n"
-        "    return f'Hello, {name}'\n",
+        "import math\n\ndef area(r):\n    return math.pi * r * r\n\ndef hello(name):\n    return f'Hello, {name}'\n",
         encoding="utf-8",
     )
 
@@ -33,14 +28,13 @@ def test_split_function_in_simple_script(tmp_path: Path) -> None:
     assert "def area(r):" in extracted
 
 
-
 def test_split_function_in_package_module(tmp_path: Path) -> None:
     pkg = tmp_path / "app"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("", encoding="utf-8")
     mod = pkg / "service.py"
     mod.write_text(
-        "\"\"\"Service helpers.\"\"\"\n\n"
+        '"""Service helpers."""\n\n'
         "import json\n\n"
         "def encode(data):\n"
         "    return json.dumps(data)\n\n"
@@ -62,7 +56,6 @@ def test_split_function_in_package_module(tmp_path: Path) -> None:
     assert "import json" in extracted
 
 
-
 def test_split_function_copies_top_level_dependencies(tmp_path: Path) -> None:
     source = tmp_path / "main.py"
     source.write_text(
@@ -70,8 +63,9 @@ def test_split_function_copies_top_level_dependencies(tmp_path: Path) -> None:
         "import json\n"
         "from dataclasses import dataclass\n"
         "from pathlib import Path\n"
-        "from typing import Any\n\n"
-        "CACHE: dict[str, Any] = {}\n\n"
+        "from typing import Any\n"
+        "import random\n\n"
+        "DEFAULT_SCORES: tuple[int, ...] = (0,)\n\n"
         "@dataclass\n"
         "class User:\n"
         "    id: int\n"
@@ -85,11 +79,10 @@ def test_split_function_copies_top_level_dependencies(tmp_path: Path) -> None:
         "        User(\n"
         "            id=item['id'],\n"
         "            name=normalize_name(item['name']),\n"
-        "            scores=item.get('scores', []),\n"
+        "            scores=item.get('scores', DEFAULT_SCORES),\n"
         "        )\n"
         "        for item in raw\n"
         "    ]\n"
-        "    CACHE['users'] = users\n"
         "    return users\n",
         encoding="utf-8",
     )
@@ -98,12 +91,45 @@ def test_split_function_copies_top_level_dependencies(tmp_path: Path) -> None:
     result = split_function(resolved)
 
     extracted = result.new_module_file.read_text(encoding="utf-8")
-    assert "CACHE: dict[str, Any] = {}" in extracted
+    assert "DEFAULT_SCORES: tuple[int, ...] = (0,)" in extracted
     assert "@dataclass" in extracted
     assert "class User:" in extracted
     assert "def normalize_name(name: str) -> str:" in extracted
     assert "def load_users(path: str) -> list[User]:" in extracted
+    assert "import random" not in extracted
 
+
+def test_split_function_rejects_mutable_global_dependencies(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    original = "CACHE = {}\n\ndef remember(value):\n    CACHE['value'] = value\n    return value\n"
+    source.write_text(original, encoding="utf-8")
+
+    resolved = resolve_target(parse_target("main.remember"), cwd=tmp_path)
+
+    with pytest.raises(FunctionExtractionError, match="mutable module global"):
+        split_function(resolved)
+
+    assert source.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "modules").exists()
+
+
+def test_split_function_refuses_to_overwrite_existing_module(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "def area(r):\n    return r * r\n",
+        encoding="utf-8",
+    )
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    existing = modules / "area.py"
+    existing.write_text("# existing\n", encoding="utf-8")
+
+    resolved = resolve_target(parse_target("main.area"), cwd=tmp_path)
+
+    with pytest.raises(FunctionExtractionError, match="Refusing to overwrite"):
+        split_function(resolved)
+
+    assert existing.read_text(encoding="utf-8") == "# existing\n"
 
 
 def test_split_function_merges_package_imports_and_updates_init(tmp_path: Path) -> None:
@@ -137,11 +163,7 @@ def test_split_function_merges_package_imports_and_updates_init(tmp_path: Path) 
 def test_split_function_preview_does_not_write_files(tmp_path: Path) -> None:
     source = tmp_path / "main.py"
     original = (
-        "import math\n\n"
-        "def area(r):\n"
-        "    return math.pi * r * r\n\n"
-        "def hello(name):\n"
-        "    return f'Hello, {name}'\n"
+        "import math\n\ndef area(r):\n    return math.pi * r * r\n\ndef hello(name):\n    return f'Hello, {name}'\n"
     )
     source.write_text(original, encoding="utf-8")
 

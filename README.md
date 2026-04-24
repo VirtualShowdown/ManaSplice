@@ -30,7 +30,7 @@ def greet(name: str) -> str:
 Run:
 
 ```bash
-uv run Splinter splitfunc main.area
+uv run splinter splitfunc main.area
 ```
 
 Result:
@@ -65,35 +65,36 @@ uv sync
 To run the CLI without installing it globally:
 
 ```bash
-uv run Splinter --help
+uv run splinter --help
 ```
 
 ## Commands
 
 ```bash
-Splinter splitfunc <module>.<function>
-Splinter splitall <path/to/file.py>
-Splinter splitall --dir <directory>
-Splinter undo [count]
-Splinter splitfunc <module>.<function> --preview
-Splinter splitall <path/to/file.py> --preview
-Splinter splitfunc <module>.<function> --validate
-Splinter splitall <path/to/file.py> --public-only --exclude main,_*
-Splinter splitfunc <module>.<function> --output-package generated
+splinter splitfunc <module>.<function>
+splinter splitall <path/to/file.py>
+splinter splitall --dir <directory>
+splinter undo [count]
+splinter splitfunc <module>.<function> --preview
+splinter splitall <path/to/file.py> --preview
+splinter splitfunc <module>.<function> --validate
+splinter splitall <path/to/file.py> --public-only --exclude main,_*
+splinter splitfunc <module>.<function> --output-package generated
+splinter splitfunc <module>.<function> --force
 ```
 
 Examples:
 
 ```bash
-uv run Splinter splitfunc main.area
-uv run Splinter splitfunc package.utils.normalize_name
-uv run Splinter splitall main.py
-uv run Splinter splitall --dir app
-uv run Splinter splitall main.py --preview
-uv run Splinter splitall main.py --public-only --exclude main,_*
-uv run Splinter splitfunc main.area --validate
-uv run Splinter splitfunc main.area --output-package generated
-uv run Splinter undo
+uv run splinter splitfunc main.area
+uv run splinter splitfunc package.utils.normalize_name
+uv run splinter splitall main.py
+uv run splinter splitall --dir app
+uv run splinter splitall main.py --preview
+uv run splinter splitall main.py --public-only --exclude main,_*
+uv run splinter splitfunc main.area --validate
+uv run splinter splitfunc main.area --output-package generated
+uv run splinter undo
 ```
 
 ## Notes
@@ -104,6 +105,8 @@ uv run Splinter undo
 - Use `--validate` to make Splinter parse the generated Python source before it writes changes.
 - Use `--include`, `--exclude`, and `--public-only` to make `splitall` selective instead of splitting every top-level function.
 - Use `--output-package` if you want generated modules somewhere other than `modules/`.
+- Splinter refuses to overwrite an existing generated module unless you pass `--force`.
+- Splinter refuses splits that depend on mutable top-level globals, because copying those globals into a new module changes runtime state.
 - Splinter now refuses to split functions that participate in a local top-level dependency cycle, such as simple mutual recursion.
 - Every non-preview split records rollback history in `.splinter_history.json`, and `undo` replays the last recorded operation.
 - The generated `modules/` package is part of the rewritten code, not just scratch output.
@@ -114,6 +117,8 @@ Run tests with:
 
 ```bash
 uv run python -m pytest tests --basetemp .pytest_tmp
+uv run ruff check src tests
+uv run mypy
 ```
 
 ## _CONTRIBUTION_
