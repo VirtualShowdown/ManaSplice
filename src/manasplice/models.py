@@ -19,6 +19,11 @@ class SplitOptions:
     output_package: str = "modules"
     validate: bool = False
     force: bool = False
+    output_file: Path | None = None
+    extracted_name: str | None = None
+    append: bool = False
+    keep_decorators: bool = True
+    format_tool: str | None = None
 
 
 @dataclass(slots=True)

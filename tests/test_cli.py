@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import tempfile
 from pathlib import Path
 
 from manasplice.cli import main
@@ -238,6 +240,50 @@ def test_check_reports_safety_failures_without_writing(tmp_path: Path, capsys) -
     assert "mutable module global" in output
 
 
+def test_project_check_detects_source_module_self_import(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    source.write_text("import main\n\n\ndef area(r):\n    return r * r\n", encoding="utf-8")
+
+    exit_code = main(["check", "main.area", "--cwd", str(tmp_path), "--project-check"])
+
+    assert exit_code == 1
+    assert "Potential circular import" in capsys.readouterr().out
+    assert not (tmp_path / "modules").exists()
+
+
+def test_git_commit_preflight_does_not_write_outside_git(tmp_path: Path, capsys) -> None:
+    del tmp_path
+    temp_dir = tempfile.TemporaryDirectory(prefix="manasplice_no_git_")
+    project = Path(temp_dir.name)
+    source = project / "main.py"
+    original = "def area(r):\n    return r * r\n"
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["splitfunc", "main.area", "--cwd", str(project), "--git-commit"])
+
+    assert exit_code == 1
+    assert "--git-commit was requested" in capsys.readouterr().out
+    assert source.read_text(encoding="utf-8") == original
+    assert not (project / "modules").exists()
+    temp_dir.cleanup()
+
+
+def test_git_commit_still_commits_inside_git(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "qa@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "QA"], cwd=tmp_path, check=True)
+    source = tmp_path / "main.py"
+    source.write_text("def area(r):\n    return r * r\n", encoding="utf-8")
+    subprocess.run(["git", "add", "main.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    exit_code = main(["splitfunc", "main.area", "--cwd", str(tmp_path), "--git-commit"])
+
+    assert exit_code == 0
+    log = subprocess.run(["git", "log", "--oneline", "-2"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    assert "manasplice splitfunc main.area" in log.stdout
+
+
 def test_splitall_supports_include_exclude_and_public_only_filters(tmp_path: Path, capsys) -> None:
     source = tmp_path / "main.py"
     source.write_text(
@@ -291,6 +337,341 @@ def test_splitfunc_supports_custom_output_package(tmp_path: Path) -> None:
     assert "from generated import area" in source.read_text(encoding="utf-8")
     assert (tmp_path / "generated" / "area.py").exists()
     assert (tmp_path / "generated" / "__init__.py").exists()
+
+
+def test_splitfunc_supports_custom_output_and_name(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text("def area(r):\n    return r * r\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "splitfunc",
+            "main.area",
+            "--cwd",
+            str(tmp_path),
+            "--output",
+            "modules/geometry.py",
+            "--name",
+            "circle_area",
+        ]
+    )
+
+    assert exit_code == 0
+    assert "from modules.geometry import circle_area as area" in source.read_text(encoding="utf-8")
+    assert "def circle_area(r):" in (tmp_path / "modules" / "geometry.py").read_text(encoding="utf-8")
+    assert "from .geometry import circle_area" in (tmp_path / "modules" / "__init__.py").read_text(encoding="utf-8")
+
+
+def test_splitfunc_into_appends_existing_module(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text("def area(r):\n    return r * r\n", encoding="utf-8")
+    modules = tmp_path / "modules"
+    modules.mkdir()
+    (modules / "geometry.py").write_text("def diameter(r):\n    return 2 * r\n", encoding="utf-8")
+
+    exit_code = main(["splitfunc", "main.area", "--cwd", str(tmp_path), "--into", "modules/geometry.py"])
+
+    assert exit_code == 0
+    geometry = (modules / "geometry.py").read_text(encoding="utf-8")
+    assert "def diameter(r):" in geometry
+    assert "def area(r):" in geometry
+    assert "from modules.geometry import area" in source.read_text(encoding="utf-8")
+
+
+def test_splitall_directory_recursive(tmp_path: Path) -> None:
+    nested = tmp_path / "pkg" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "leaf.py").write_text("def leaf():\n    return 1\n", encoding="utf-8")
+
+    exit_code = main(["splitall", "--dir", "pkg", "--cwd", str(tmp_path), "--recursive"])
+
+    assert exit_code == 0
+    assert "from modules import leaf" in (nested / "leaf.py").read_text(encoding="utf-8")
+
+
+def test_splitall_recursive_skips_generated_modules(tmp_path: Path) -> None:
+    source = tmp_path / "pkg" / "feature.py"
+    generated = tmp_path / "pkg" / "modules" / "already.py"
+    source.parent.mkdir(parents=True)
+    generated.parent.mkdir(parents=True)
+    source.write_text("def feature():\n    return 'feature'\n", encoding="utf-8")
+    generated.write_text("def generated_helper():\n    return 'generated'\n", encoding="utf-8")
+
+    exit_code = main(["splitall", "--dir", "pkg", "--cwd", str(tmp_path), "--recursive"])
+
+    assert exit_code == 0
+    assert (tmp_path / "pkg" / "modules" / "feature.py").exists()
+    assert not (tmp_path / "pkg" / "modules" / "modules" / "generated_helper.py").exists()
+
+
+def test_splitall_manual_group(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "def area(r):\n    return r * r\n\n"
+        "def diameter(r):\n    return 2 * r\n\n"
+        "def slugify(value):\n    return value.lower()\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "splitall",
+            "main.py",
+            "--cwd",
+            str(tmp_path),
+            "--group",
+            "area,diameter",
+            "--module",
+            "geometry",
+        ]
+    )
+
+    assert exit_code == 0
+    geometry = (tmp_path / "modules" / "geometry.py").read_text(encoding="utf-8")
+    assert "def area(r):" in geometry
+    assert "def diameter(r):" in geometry
+    assert (tmp_path / "modules" / "slugify.py").exists()
+
+
+def test_splitall_manual_group_keeps_later_package_imports_resolvable(tmp_path: Path) -> None:
+    package = tmp_path / "app"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    source = package / "service.py"
+    source.write_text(
+        "def area(r):\n"
+        "    return r * r\n\n"
+        "def diameter(r):\n"
+        "    return 2 * r\n\n"
+        "def use(r):\n"
+        "    return area(r) + diameter(r)\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "splitall",
+            "app/service.py",
+            "--cwd",
+            str(tmp_path),
+            "--group",
+            "area,diameter",
+            "--module",
+            "geometry",
+        ]
+    )
+
+    assert exit_code == 0
+    generated_use = (package / "modules" / "use.py").read_text(encoding="utf-8")
+    assert "from .geometry import area" in generated_use
+    assert "from .geometry import diameter" in generated_use
+
+    import sys
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import app.service as service
+
+        assert service.area(2) == 4
+        assert service.diameter(2) == 4
+        assert service.use(2) == 8
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("app.service", None)
+        sys.modules.pop("app", None)
+
+
+def test_splitall_manual_group_rejects_missing_function(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    source.write_text("def area(r):\n    return r * r\n", encoding="utf-8")
+
+    exit_code = main(["splitall", "main.py", "--cwd", str(tmp_path), "--group", "missing", "--module", "geometry"])
+
+    assert exit_code == 1
+    assert "Manual group function(s) not found" in capsys.readouterr().out
+    assert "def area" in source.read_text(encoding="utf-8")
+
+
+def test_preview_json_is_machine_readable(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    source.write_text("def area(r):\n    return r * r\n", encoding="utf-8")
+
+    exit_code = main(["splitall", "main.py", "--cwd", str(tmp_path), "--preview", "--json"])
+
+    assert exit_code == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["status"] == "ok"
+    assert data["count"] == 1
+    assert data["results"][0]["functions"] == ["area"]
+
+
+def test_check_json_reports_function_kinds(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "async def fetch_user():\n    return 1\n\n"
+        "def stream_rows():\n    yield 1\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["check", "main.py", "--cwd", str(tmp_path), "--json"])
+
+    assert exit_code == 0
+    data = json.loads(capsys.readouterr().out)
+    kinds = {result["functions"][0]: result["function_kinds"] for result in data["results"]}
+    assert kinds["fetch_user"]["fetch_user"]["async"] is True
+    assert kinds["stream_rows"]["stream_rows"]["generator"] is True
+
+
+def test_check_reports_async_and_generator_functions(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "async def fetch_user():\n    return 1\n\n"
+        "def stream_rows():\n    yield 1\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["check", "main.py", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Found async function: fetch_user" in output
+    assert "Found generator function: stream_rows" in output
+
+
+def test_splitfunc_moves_overloads_with_implementation(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "from typing import overload\n\n"
+        "@overload\n"
+        "def parse(value: str) -> int: ...\n\n"
+        "@overload\n"
+        "def parse(value: int) -> int: ...\n\n"
+        "def parse(value):\n"
+        "    return int(value)\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["splitfunc", "main.parse", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "@overload" not in updated
+    assert "from modules import parse" in updated
+    helper = (tmp_path / "modules" / "parse.py").read_text(encoding="utf-8")
+    assert "from typing import overload" in helper
+    assert helper.count("@overload") == 2
+
+
+def test_strip_decorators_removes_extracted_decorators(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "def deco(func):\n    return func\n\n"
+        "@deco\n"
+        "def route_handler():\n    return 1\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["splitfunc", "main.route_handler", "--cwd", str(tmp_path), "--strip-decorators"])
+
+    assert exit_code == 0
+    extracted = (tmp_path / "modules" / "route_handler.py").read_text(encoding="utf-8")
+    assert "@deco" not in extracted
+
+
+def test_splitmethod_creates_forwarding_wrapper(tmp_path: Path) -> None:
+    source = tmp_path / "service.py"
+    source.write_text(
+        "class UserService:\n"
+        "    def normalize_name(self, name):\n"
+        "        return name.strip().title()\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["splitmethod", "service.UserService.normalize_name", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "from modules.user_service_normalize_name import normalize_name" in updated
+    assert "return normalize_name(self, name)" in updated
+    assert (tmp_path / "modules" / "user_service_normalize_name.py").exists()
+
+
+def test_splitmethod_copies_imports_and_constants(tmp_path: Path) -> None:
+    source = tmp_path / "service.py"
+    source.write_text(
+        "import math\n\n"
+        "PREFIX = 'area:'\n\n"
+        "class Calculator:\n"
+        "    def label_area(self, radius):\n"
+        "        return PREFIX + str(round(math.pi * radius * radius, 2))\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["splitmethod", "service.Calculator.label_area", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    helper = (tmp_path / "modules" / "calculator_label_area.py").read_text(encoding="utf-8")
+    assert "import math" in helper
+    assert "PREFIX = 'area:'" in helper
+
+    import sys
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import service
+
+        assert service.Calculator().label_area(2) == "area:12.57"
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("service", None)
+
+
+def test_splitmethod_supports_multiline_signature(tmp_path: Path) -> None:
+    source = tmp_path / "service.py"
+    source.write_text(
+        "class UserService:\n"
+        "    def normalize_name(\n"
+        "        self,\n"
+        "        name,\n"
+        "    ):\n"
+        "        return name.strip().title()\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["splitmethod", "service.UserService.normalize_name", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    assert "return normalize_name(self, name)" in source.read_text(encoding="utf-8")
+
+
+def test_splitmethod_rejects_custom_decorators(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "service.py"
+    source.write_text(
+        "def traced(func):\n"
+        "    return func\n\n"
+        "class UserService:\n"
+        "    @traced\n"
+        "    def normalize_name(self, name):\n"
+        "        return name.strip().title()\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["splitmethod", "service.UserService.normalize_name", "--cwd", str(tmp_path)])
+
+    assert exit_code == 1
+    assert "Refusing to split decorated method" in capsys.readouterr().out
+
+
+def test_config_init_and_show(tmp_path: Path, capsys) -> None:
+    init_exit = main(["config", "init", "--cwd", str(tmp_path)])
+    show_exit = main(["config", "show", "--cwd", str(tmp_path), "--json"])
+
+    assert init_exit == 0
+    assert show_exit == 0
+    assert "[tool.manasplice]" in (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
+    output_lines = capsys.readouterr().out.strip().splitlines()
+    data = json.loads("\n".join(output_lines[1:]))
+    assert data["config"]["output_package"] == "modules"
 
 
 def test_splitfunc_validate_rejects_invalid_generated_output(tmp_path: Path, monkeypatch, capsys) -> None:

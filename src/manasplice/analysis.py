@@ -26,12 +26,15 @@ def analyze_module(source_text: str, function_name: str, module_file: Path) -> M
             continue
 
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            definitions.setdefault(stmt.name, stmt)
+            if not _is_overload_stub(stmt):
+                definitions.setdefault(stmt.name, stmt)
         elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             for name in iter_assigned_names(stmt):
                 definitions.setdefault(name, stmt)
 
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == function_name:
+            if _is_overload_stub(stmt):
+                continue
             if target_info is not None:
                 raise FunctionExtractionError(
                     f"Found duplicate top-level definitions for function '{function_name}' in '{module_file}'."
@@ -79,12 +82,15 @@ def analyze_module_for_group(source_text: str, function_names: list[str], module
             continue
 
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            definitions.setdefault(stmt.name, stmt)
+            if not _is_overload_stub(stmt):
+                definitions.setdefault(stmt.name, stmt)
         elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             for name in iter_assigned_names(stmt):
                 definitions.setdefault(name, stmt)
 
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name in func_set:
+            if _is_overload_stub(stmt):
+                continue
             if stmt.name in found:
                 raise FunctionExtractionError(
                     f"Found duplicate top-level definitions for '{stmt.name}' in '{module_file}'."
@@ -151,3 +157,19 @@ def statement_start_lineno(node: ast.stmt) -> int:
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.decorator_list:
         return min(decorator.lineno for decorator in node.decorator_list)
     return node.lineno
+
+
+def _is_overload_stub(node: ast.stmt) -> bool:
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    return any(_decorator_name(decorator) == "overload" for decorator in node.decorator_list)
+
+
+def _decorator_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Call):
+        return _decorator_name(node.func)
+    return ""

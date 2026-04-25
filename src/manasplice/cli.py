@@ -3,16 +3,30 @@ from __future__ import annotations
 import argparse
 import ast
 import fnmatch
+import json
 import os
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 from colorama import Fore, Style, just_fix_windows_console
 
+from .analysis import iter_assigned_names, iter_imported_names, statement_start_lineno
 from .config import load_project_config
+from .dependencies import collect_dependency_names, collect_required_import_names, render_dependency_blocks
 from .exceptions import PySplitError
 from .history import record_split_history, rollback_last
 from .resolver import TargetSpec, parse_target, resolve_target
+from .rewrite import (
+    build_import_block,
+    build_preview_diffs,
+    compose_new_module_text,
+    insert_import,
+    parse_package_exports,
+    transform_function_block,
+    updated_package_exports,
+)
 from .splitter import (
     FileChange,
     GroupSplitResult,
@@ -68,9 +82,12 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Replace an existing generated module if the output path already exists.",
     )
+    _add_common_operation_flags(splitfunc)
     splitfunc.set_defaults(
         output_package=config.get("output_package", "modules"),
         validate=config.get("validate", False),
+        recursive=config.get("recursive", False),
+        format=config.get("format", None),
     )
 
     splitall = subparsers.add_parser(
@@ -141,6 +158,10 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Replace existing generated modules if output paths already exist.",
     )
+    splitall.add_argument("--recursive", action="store_true", help="Recurse into subdirectories when splitting --dir.")
+    splitall.add_argument("--group", help="Comma-separated functions to place in one module.")
+    splitall.add_argument("--module", help="Module name to use with --group.")
+    _add_common_operation_flags(splitall)
     splitall.set_defaults(
         output_package=config.get("output_package", "modules"),
         validate=config.get("validate", False),
@@ -149,6 +170,8 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         exclude=config.get("exclude"),
         related=config.get("related", False),
         auto_group=config.get("auto_group", False),
+        recursive=config.get("recursive", False),
+        format=config.get("format", None),
     )
 
     check = subparsers.add_parser(
@@ -208,6 +231,9 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Allow checks to pass when an output module already exists.",
     )
+    check.add_argument("--recursive", action="store_true", help="Recurse into subdirectories when checking --dir.")
+    check.add_argument("--project-check", action="store_true", help="Run additional project import safety checks.")
+    check.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     check.set_defaults(
         output_package=config.get("output_package", "modules"),
         validate=config.get("validate", False),
@@ -216,7 +242,19 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         exclude=config.get("exclude"),
         related=config.get("related", False),
         auto_group=config.get("auto_group", False),
+        recursive=config.get("recursive", False),
     )
+
+    splitmethod = subparsers.add_parser("splitmethod", help="Extract a class method behind a forwarding wrapper.")
+    splitmethod.add_argument("target", help="Target in the form package.module.ClassName.method_name")
+    splitmethod.add_argument("--cwd", default=".", help="Project root to resolve from. Defaults to current directory.")
+    splitmethod.add_argument("--preview", action="store_true", help="Show the planned changes without writing files.")
+    splitmethod.add_argument("--output-package", default=config.get("output_package", "modules"))
+    splitmethod.add_argument("--force", action="store_true")
+    splitmethod.add_argument("--json", action="store_true")
+    splitmethod.add_argument("--format", nargs="?", const="ruff", default=config.get("format", None))
+    splitmethod.add_argument("--require-clean-git", action="store_true")
+    splitmethod.add_argument("--git-commit", action="store_true")
 
     undo = subparsers.add_parser(
         "undo",
@@ -235,6 +273,14 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         help="Project root to resolve from. Defaults to current directory.",
     )
 
+    config_parser = subparsers.add_parser("config", help="Manage ManaSplice project configuration.")
+    config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
+    config_init = config_subparsers.add_parser("init", help="Create a [tool.manasplice] pyproject.toml section.")
+    config_init.add_argument("--cwd", default=".")
+    config_show = config_subparsers.add_parser("show", help="Show the discovered ManaSplice configuration.")
+    config_show.add_argument("--cwd", default=".")
+    config_show.add_argument("--json", action="store_true")
+
     return parser
 
 
@@ -251,22 +297,32 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "splitfunc":
             cwd = Path(args.cwd)
+            _require_clean_git(cwd, args.require_clean_git)
+            _preflight_git_commit(cwd, args.git_commit)
             spec = parse_target(args.target)
             resolved = resolve_target(spec, cwd=cwd)
-            options = _build_split_options(args)
+            options = _build_split_options(args, cwd=cwd)
             result = split_function(resolved, options=options)
-            _print_split_result(result, show_diffs=args.preview)
-            print(f"Updated: {result.module_file}")
-            print(f"Created: {result.new_module_file}")
-            print(f"Inserted import: {result.import_statement}")
+            _format_results([result], _normalize_format_tool(args.format))
+            if args.json:
+                _print_json({"status": "ok", "results": [_result_to_json(result)]})
+            else:
+                _print_split_result(result, show_diffs=args.preview)
+                print(f"Updated: {result.module_file}")
+                print(f"Created: {result.new_module_file}")
+                print(f"Inserted import: {result.import_statement}")
             if not args.preview:
                 history_file = record_split_history(cwd, f"splitfunc {args.target}", [result])
-                print(f"Recorded rollback history: {history_file}")
+                if not args.json:
+                    print(f"Recorded rollback history: {history_file}")
+                _git_commit(cwd, args.git_commit, f"manasplice splitfunc {args.target}", [result])
             return 0
         if args.command == "splitall":
             cwd = Path(args.cwd)
-            options = _build_split_options(args)
-            split_count = _split_all(
+            _require_clean_git(cwd, args.require_clean_git)
+            _preflight_git_commit(cwd, args.git_commit)
+            options = _build_split_options(args, cwd=cwd)
+            results = _split_all(
                 args.path,
                 args.directory,
                 cwd,
@@ -275,17 +331,33 @@ def main(argv: list[str] | None = None) -> int:
                 exclude_patterns=_parse_patterns(args.exclude),
                 public_only=args.public_only,
                 auto_group=args.auto_group or args.related,
+                recursive=args.recursive,
+                output_package=args.output_package,
+                manual_group=_parse_manual_group(args.group, args.module),
+                emit_output=not args.json,
             )
+            _format_results(results, _normalize_format_tool(args.format))
+            split_count = _count_results(results)
             if split_count == 0:
-                print("No top-level functions found.")
+                if args.json:
+                    _print_json({"status": "ok", "count": 0, "results": []})
+                else:
+                    print("No top-level functions found.")
             else:
-                action = "Would split" if args.preview else "Split"
-                print(f"{action} {split_count} function(s).")
+                if args.json:
+                    _print_json(
+                        {"status": "ok", "count": split_count, "results": [_result_to_json(r) for r in results]}
+                    )
+                else:
+                    action = "Would split" if args.preview else "Split"
+                    print(f"{action} {split_count} function(s).")
+                if not args.preview:
+                    _git_commit(cwd, args.git_commit, "manasplice splitall", results)
             return 0
         if args.command == "check":
             cwd = Path(args.cwd)
             options = _build_split_options(args, preview=True)
-            check_count = _check(
+            results = _check(
                 args.target_or_path,
                 args.directory,
                 cwd,
@@ -294,19 +366,55 @@ def main(argv: list[str] | None = None) -> int:
                 exclude_patterns=_parse_patterns(args.exclude),
                 public_only=args.public_only,
                 auto_group=args.auto_group or args.related,
+                recursive=args.recursive,
+                project_check=args.project_check,
+                emit_output=not args.json,
             )
+            check_count = _count_results(results)
             if check_count == 0:
-                print("Check passed: no top-level functions found.")
+                if args.json:
+                    _print_json({"status": "ok", "count": 0, "results": []})
+                else:
+                    print("Check passed: no top-level functions found.")
             else:
-                print(f"Check passed: {check_count} function(s) can be split.")
+                if args.json:
+                    _print_json(
+                        {"status": "ok", "count": check_count, "results": [_result_to_json(r) for r in results]}
+                    )
+                else:
+                    print(f"Check passed: {check_count} function(s) can be split.")
+            return 0
+        if args.command == "splitmethod":
+            cwd = Path(args.cwd)
+            _require_clean_git(cwd, args.require_clean_git)
+            _preflight_git_commit(cwd, args.git_commit)
+            result = _split_method(args, cwd)
+            _format_results([result], _normalize_format_tool(args.format))
+            if args.json:
+                _print_json({"status": "ok", "results": [_result_to_json(result)]})
+            else:
+                _print_split_result(result, show_diffs=args.preview)
+                print(f"Updated: {result.module_file}")
+                print(f"Created: {result.new_module_file}")
+                print(f"Inserted import: {result.import_statement}")
+            if not args.preview:
+                history_file = record_split_history(cwd, f"splitmethod {args.target}", [result])
+                if not args.json:
+                    print(f"Recorded rollback history: {history_file}")
+                _git_commit(cwd, args.git_commit, f"manasplice splitmethod {args.target}", [result])
             return 0
         if args.command == "undo":
             undo_count, history_file = rollback_last(Path(args.cwd), args.count)
             print(f"Rolled back {undo_count} operation(s).")
             print(f"Updated rollback history: {history_file}")
             return 0
+        if args.command == "config":
+            return _handle_config(args)
     except PySplitError as exc:
-        print(f"ManaSplice error: {exc}")
+        if getattr(args, "json", False):
+            _print_json({"status": "error", "error": str(exc)})
+        else:
+            print(f"ManaSplice error: {exc}")
         return 1
 
     parser.print_help()
@@ -324,9 +432,18 @@ def _split_all(
     public_only: bool,
     auto_group: bool = False,
     show_diffs: bool = True,
-) -> int:
-    target_files = _resolve_splitall_files(path_arg, directory_arg, cwd)
-    split_count = 0
+    recursive: bool = False,
+    output_package: str = "modules",
+    manual_group: tuple[list[str], str] | None = None,
+    emit_output: bool = True,
+) -> list[SplitResult | GroupSplitResult]:
+    target_files = _resolve_splitall_files(
+        path_arg,
+        directory_arg,
+        cwd,
+        recursive=recursive,
+        output_package=output_package,
+    )
     results: list[SplitResult | GroupSplitResult] = []
 
     for file_path in target_files:
@@ -339,16 +456,18 @@ def _split_all(
             public_only=public_only,
             auto_group=auto_group,
             show_diffs=show_diffs,
+            manual_group=manual_group,
+            emit_output=emit_output,
         )
         results.extend(file_results)
-        split_count += sum(len(r.function_names) if isinstance(r, GroupSplitResult) else 1 for r in file_results)
 
     if results and not options.preview:
         descriptor = path_arg if path_arg else f"--dir {directory_arg}"
         history_file = record_split_history(cwd, f"splitall {descriptor}", results)
-        print(f"Recorded rollback history: {history_file}")
+        if emit_output:
+            print(f"Recorded rollback history: {history_file}")
 
-    return split_count
+    return results
 
 
 def _check(
@@ -361,9 +480,12 @@ def _check(
     exclude_patterns: list[str],
     public_only: bool,
     auto_group: bool,
-) -> int:
+    recursive: bool,
+    project_check: bool,
+    emit_output: bool = True,
+) -> list[SplitResult | GroupSplitResult]:
     if directory_arg or _looks_like_file_path(target_or_path):
-        return _split_all(
+        results = _split_all(
             target_or_path,
             directory_arg,
             cwd,
@@ -373,7 +495,13 @@ def _check(
             public_only=public_only,
             auto_group=auto_group,
             show_diffs=False,
+            recursive=recursive,
+            output_package=options.output_package,
+            emit_output=emit_output,
         )
+        if project_check:
+            _run_project_checks(results, cwd, emit_output=emit_output)
+        return results
 
     if not target_or_path:
         raise PySplitError("check requires a target, a Python file path, or --dir.")
@@ -381,11 +509,21 @@ def _check(
     spec = parse_target(target_or_path)
     resolved = resolve_target(spec, cwd=cwd)
     result = split_function(resolved, options=options)
-    _print_split_result(result, show_diffs=False)
-    return 1
+    if project_check:
+        _run_project_checks([result], cwd, emit_output=emit_output)
+    if emit_output:
+        _print_split_result(result, show_diffs=False)
+    return [result]
 
 
-def _resolve_splitall_files(path_arg: str | None, directory_arg: str | None, cwd: Path) -> list[Path]:
+def _resolve_splitall_files(
+    path_arg: str | None,
+    directory_arg: str | None,
+    cwd: Path,
+    *,
+    recursive: bool,
+    output_package: str,
+) -> list[Path]:
     if bool(path_arg) == bool(directory_arg):
         raise PySplitError("splitall requires either a file path or --dir, but not both.")
 
@@ -394,7 +532,13 @@ def _resolve_splitall_files(path_arg: str | None, directory_arg: str | None, cwd
         if not directory.exists() or not directory.is_dir():
             raise PySplitError(f"Directory not found: {directory}")
 
-        return sorted(file_path for file_path in directory.glob("*.py") if file_path.name != "__init__.py")
+        iterator = directory.rglob("*.py") if recursive else directory.glob("*.py")
+        output_parts = set(output_package.split("."))
+        return sorted(
+            file_path
+            for file_path in iterator
+            if file_path.name != "__init__.py" and not output_parts.intersection(file_path.relative_to(directory).parts)
+        )
 
     file_path = (cwd / (path_arg or "")).resolve()
     if not file_path.exists() or not file_path.is_file():
@@ -415,6 +559,8 @@ def _split_all_in_file(
     public_only: bool,
     auto_group: bool = False,
     show_diffs: bool = True,
+    manual_group: tuple[list[str], str] | None = None,
+    emit_output: bool = True,
 ) -> list[SplitResult | GroupSplitResult]:
     function_names = _list_top_level_function_names(
         file_path,
@@ -425,18 +571,43 @@ def _split_all_in_file(
     module_path = _module_path_from_file(file_path, cwd)
     results: list[SplitResult | GroupSplitResult] = []
     groups = _find_related_function_groups(file_path, function_names)
+    if manual_group is not None:
+        group_names, module_name = manual_group
+        missing_names = sorted(set(group_names) - set(function_names))
+        if missing_names:
+            raise PySplitError(f"Manual group function(s) not found in {file_path}: {', '.join(missing_names)}.")
+        requested = [name for name in group_names if name in function_names]
+        if requested:
+            primary = requested[0]
+            spec = TargetSpec(module_path=module_path, function_name=primary)
+            resolved = resolve_target(spec, cwd=cwd)
+            group_options = SplitOptions(
+                preview=options.preview,
+                output_package=options.output_package,
+                validate=options.validate,
+                force=options.force,
+                extracted_name=module_name,
+                format_tool=options.format_tool,
+            )
+            group_result = split_group(resolved, requested, options=group_options)
+            results.append(group_result)
+            if emit_output:
+                _print_group_result(group_result, show_diffs=show_diffs)
+            function_names = [name for name in function_names if name not in set(requested)]
 
     if not auto_group:
-        _print_auto_group_recommendations(groups)
+        if emit_output:
+            _print_auto_group_recommendations(groups)
         for function_name in function_names:
             spec = TargetSpec(module_path=module_path, function_name=function_name)
             resolved = resolve_target(spec, cwd=cwd)
             result = split_function(resolved, options=options)
             results.append(result)
-            _print_split_result(result, show_diffs=show_diffs)
-            print(f"Updated: {result.module_file}")
-            print(f"Created: {result.new_module_file}")
-            print(f"Inserted import: {result.import_statement}")
+            if emit_output:
+                _print_split_result(result, show_diffs=show_diffs)
+                print(f"Updated: {result.module_file}")
+                print(f"Created: {result.new_module_file}")
+                print(f"Inserted import: {result.import_statement}")
         return results
 
     for group in groups:
@@ -446,17 +617,19 @@ def _split_all_in_file(
             resolved = resolve_target(spec, cwd=cwd)
             result = split_function(resolved, options=options)
             results.append(result)
-            _print_split_result(result, show_diffs=show_diffs)
-            print(f"Updated: {result.module_file}")
-            print(f"Created: {result.new_module_file}")
-            print(f"Inserted import: {result.import_statement}")
+            if emit_output:
+                _print_split_result(result, show_diffs=show_diffs)
+                print(f"Updated: {result.module_file}")
+                print(f"Created: {result.new_module_file}")
+                print(f"Inserted import: {result.import_statement}")
         else:
             primary = group[0]
             spec = TargetSpec(module_path=module_path, function_name=primary)
             resolved = resolve_target(spec, cwd=cwd)
             group_result = split_group(resolved, group, options=options)
             results.append(group_result)
-            _print_group_result(group_result, show_diffs=show_diffs)
+            if emit_output:
+                _print_group_result(group_result, show_diffs=show_diffs)
 
     return results
 
@@ -489,7 +662,11 @@ def _list_top_level_function_names(
     except SyntaxError as exc:
         raise PySplitError(f"Could not parse '{file_path}': {exc}") from exc
 
-    function_names = [stmt.name for stmt in tree.body if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    function_names = [
+        stmt.name
+        for stmt in tree.body
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and not _is_overload_function(stmt)
+    ]
 
     if public_only:
         function_names = [name for name in function_names if not name.startswith("_")]
@@ -519,6 +696,8 @@ def _print_split_result(result: SplitResult, *, show_diffs: bool = True) -> None
     verb = _color_text(action, Fore.CYAN if result.preview else Fore.GREEN)
     function_name = _color_text(result.function_name, Fore.MAGENTA)
     print(f"{verb} '{function_name}' successfully.")
+    for line in _function_kind_report(result.new_module_text, result.function_name):
+        print(line)
     if result.preview:
         _print_change_plan(
             functions=[result.function_name],
@@ -538,6 +717,9 @@ def _print_group_result(result: GroupSplitResult, *, show_diffs: bool = True) ->
     verb = _color_text(action, Fore.CYAN if result.preview else Fore.GREEN)
     names_str = _color_text(", ".join(f"'{n}'" for n in result.function_names), Fore.MAGENTA)
     print(f"{verb} related group [{names_str}] -> {result.new_module_file.name}")
+    for function_name in result.function_names:
+        for line in _function_kind_report(result.new_module_text, function_name):
+            print(line)
     if result.preview:
         _print_change_plan(
             functions=result.function_names,
@@ -563,13 +745,411 @@ def _parse_patterns(raw_patterns: str | list | None) -> list[str]:
     return [pattern.strip() for pattern in raw_patterns.split(",") if pattern.strip()]
 
 
-def _build_split_options(args: argparse.Namespace, *, preview: bool | None = None) -> SplitOptions:
+def _add_common_operation_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    parser.add_argument("--output", help="Write the extracted function to this module file path.")
+    parser.add_argument("--name", help="Rename the extracted function while preserving the original import name.")
+    parser.add_argument("--into", help="Append the extracted function to an existing module file.")
+    parser.add_argument("--format", nargs="?", const="ruff", help="Format changed files, optionally with a tool name.")
+    parser.add_argument(
+        "--require-clean-git",
+        action="store_true",
+        help="Refuse to run when git has uncommitted changes.",
+    )
+    parser.add_argument("--git-commit", action="store_true", help="Commit the split after writing files.")
+    decorators = parser.add_mutually_exclusive_group()
+    decorators.add_argument("--keep-decorators", action="store_true", default=True)
+    decorators.add_argument("--strip-decorators", action="store_true")
+
+
+def _build_split_options(
+    args: argparse.Namespace,
+    *,
+    preview: bool | None = None,
+    cwd: Path | None = None,
+) -> SplitOptions:
+    output_arg = getattr(args, "output", None)
+    into_arg = getattr(args, "into", None)
+    if output_arg and into_arg:
+        raise PySplitError("--output and --into cannot be used together.")
+    output_file = None
+    append = False
+    if output_arg:
+        output_file = ((cwd or Path(".")) / output_arg).resolve()
+    if into_arg:
+        output_file = ((cwd or Path(".")) / into_arg).resolve()
+        append = True
+    format_value = getattr(args, "format", None)
+    if format_value is True:
+        format_value = "ruff"
     return SplitOptions(
         preview=args.preview if preview is None else preview,
         output_package=args.output_package,
         validate=args.validate,
         force=args.force,
+        output_file=output_file,
+        extracted_name=getattr(args, "name", None),
+        append=append,
+        keep_decorators=not getattr(args, "strip_decorators", False),
+        format_tool=format_value,
     )
+
+
+def _parse_manual_group(group_arg: str | None, module_arg: str | None) -> tuple[list[str], str] | None:
+    if group_arg is None and module_arg is None:
+        return None
+    if not group_arg or not module_arg:
+        raise PySplitError("--group and --module must be used together.")
+    names = _parse_patterns(group_arg)
+    if not names:
+        raise PySplitError("--group must include at least one function name.")
+    if not module_arg.isidentifier():
+        raise PySplitError("--module must be a valid Python module name.")
+    return names, module_arg
+
+
+def _count_results(results: list[SplitResult | GroupSplitResult]) -> int:
+    return sum(len(r.function_names) if isinstance(r, GroupSplitResult) else 1 for r in results)
+
+
+def _result_to_json(result: SplitResult | GroupSplitResult) -> dict[str, object]:
+    names = result.function_names if isinstance(result, GroupSplitResult) else [result.function_name]
+    return {
+        "preview": result.preview,
+        "functions": names,
+        "function_kinds": {name: _function_kinds(result.new_module_text, name) for name in names},
+        "source": str(result.module_file),
+        "output_module": str(result.new_module_file),
+        "import_statement": result.import_statement,
+        "output_package": result.output_package,
+        "changes": [
+            {
+                "path": str(change.path),
+                "action": "update" if change.existed_before else "create",
+                "changed": change.before_text != change.after_text,
+            }
+            for change in result.file_changes
+        ],
+    }
+
+
+def _print_json(data: dict[str, object]) -> None:
+    print(json.dumps(data, indent=2, sort_keys=True))
+
+
+def _format_results(results: list[SplitResult | GroupSplitResult], format_tool: str | None) -> None:
+    if not results or not format_tool or results[0].preview:
+        return
+    if format_tool != "ruff":
+        raise PySplitError(f"Unsupported formatter '{format_tool}'. Only 'ruff' is supported.")
+
+    files = sorted(
+        {str(change.path) for result in results for change in result.file_changes if change.path.suffix == ".py"}
+    )
+    if not files:
+        return
+    subprocess.run(["ruff", "format", *files], check=False, capture_output=True, text=True)
+    subprocess.run(["ruff", "check", "--fix", *files], check=False, capture_output=True, text=True)
+
+
+def _normalize_format_tool(format_tool: object) -> str | None:
+    if format_tool is True:
+        return "ruff"
+    if format_tool in {False, None}:
+        return None
+    return str(format_tool)
+
+
+def _require_clean_git(cwd: Path, enabled: bool) -> None:
+    if not enabled:
+        return
+    result = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise PySplitError("--require-clean-git was requested, but this is not a git repository.")
+    if result.stdout.strip():
+        raise PySplitError("Working tree is dirty. Commit or stash changes before running with --require-clean-git.")
+
+
+def _preflight_git_commit(cwd: Path, enabled: bool) -> None:
+    if not enabled:
+        return
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, check=False)
+    if status.returncode != 0:
+        raise PySplitError("--git-commit was requested, but this is not a git repository.")
+
+
+def _git_commit(cwd: Path, enabled: bool, message: str, results: list[SplitResult | GroupSplitResult]) -> None:
+    if not enabled:
+        return
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, check=False)
+    if status.returncode != 0:
+        raise PySplitError("--git-commit was requested, but this is not a git repository.")
+    changed_paths = sorted({str(change.path) for result in results for change in result.file_changes})
+    if not changed_paths:
+        return
+    subprocess.run(["git", "add", "--", *changed_paths], cwd=cwd, check=True)
+    staged = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=cwd, check=False)
+    if staged.returncode == 0:
+        return
+    subprocess.run(["git", "commit", "-m", message], cwd=cwd, check=True)
+
+
+def _run_project_checks(results: list[SplitResult | GroupSplitResult], cwd: Path, *, emit_output: bool) -> None:
+    for result in results:
+        output_parent = result.new_module_file.parent
+        if output_parent.exists() and not output_parent.is_dir():
+            raise PySplitError(f"Generated modules package conflicts with existing path: {output_parent}")
+        source_module = _module_path_from_file(result.module_file, cwd)
+        if _imports_module(result.new_module_text, source_module) or _imports_module(result.module_text, source_module):
+            raise PySplitError(
+                f"Potential circular import introduced: generated or rewritten code imports '{source_module}'."
+            )
+    if emit_output:
+        print("Project check passed: generated imports and package path look consistent.")
+
+
+def _imports_module(source_text: str, module_path: str) -> bool:
+    try:
+        tree = ast.parse(source_text)
+    except SyntaxError:
+        return False
+    top_level = module_path.split(".", 1)[0]
+    for stmt in ast.walk(tree):
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                imported = alias.name
+                if imported == module_path or imported == top_level:
+                    return True
+        elif isinstance(stmt, ast.ImportFrom):
+            imported_from = "." * stmt.level + (stmt.module or "")
+            if imported_from == module_path:
+                return True
+    return False
+
+
+def _handle_config(args: argparse.Namespace) -> int:
+    cwd = Path(args.cwd).resolve()
+    pyproject = cwd / "pyproject.toml"
+    if args.config_command == "init":
+        block = (
+            "\n[tool.manasplice]\n"
+            'output_package = "modules"\n'
+            "validate = true\n"
+            "public_only = true\n"
+            'exclude = ["main", "_*"]\n'
+            "recursive = true\n"
+            'format = "ruff"\n'
+        )
+        if pyproject.exists():
+            text = pyproject.read_text(encoding="utf-8")
+            if "[tool.manasplice]" in text:
+                raise PySplitError(f"{pyproject} already contains [tool.manasplice].")
+            pyproject.write_text(text.rstrip() + "\n" + block, encoding="utf-8")
+        else:
+            pyproject.write_text(block.lstrip(), encoding="utf-8")
+        print(f"Wrote ManaSplice config: {pyproject}")
+        return 0
+    if args.config_command == "show":
+        config = load_project_config(cwd)
+        if args.json:
+            _print_json({"config": config})
+        else:
+            print(json.dumps(config, indent=2, sort_keys=True))
+        return 0
+    raise PySplitError("Unknown config command.")
+
+
+def _split_method(args: argparse.Namespace, cwd: Path) -> SplitResult:
+    module_path, class_name, method_name = _parse_method_target(args.target)
+    module_file = resolve_target(TargetSpec(module_path=module_path, function_name=method_name), cwd=cwd).module_file
+    source_text = read_python_source(module_file)
+    tree = ast.parse(source_text)
+    imports, import_bindings, definitions = _collect_module_bindings(tree)
+    class_node = next((stmt for stmt in tree.body if isinstance(stmt, ast.ClassDef) and stmt.name == class_name), None)
+    if class_node is None:
+        raise PySplitError(f"Class '{class_name}' was not found in '{module_file}'.")
+
+    method_node = next(
+        (
+            stmt
+            for stmt in class_node.body
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == method_name
+        ),
+        None,
+    )
+    if method_node is None or method_node.end_lineno is None:
+        raise PySplitError(f"Method '{class_name}.{method_name}' was not found in '{module_file}'.")
+
+    is_static = any(_decorator_name(decorator) == "staticmethod" for decorator in method_node.decorator_list)
+    is_classmethod = any(_decorator_name(decorator) == "classmethod" for decorator in method_node.decorator_list)
+    unsafe_decorators = [
+        _decorator_name(decorator)
+        for decorator in method_node.decorator_list
+        if _decorator_name(decorator) not in {"staticmethod", "classmethod"}
+    ]
+    if unsafe_decorators:
+        raise PySplitError(
+            f"Refusing to split decorated method '{class_name}.{method_name}' by default: "
+            f"{', '.join(unsafe_decorators)}."
+        )
+    if not is_static and (not method_node.args.args or method_node.args.args[0].arg not in {"self", "cls"}):
+        raise PySplitError("Refusing to split method without an explicit self/cls first parameter.")
+
+    output_dir = module_file.parent.joinpath(*args.output_package.split("."))
+    helper_module_name = f"{_camel_to_snake(class_name)}_{method_name}"
+    new_module_file = output_dir / f"{helper_module_name}.py"
+    if new_module_file.exists() and not args.force:
+        raise PySplitError(f"Refusing to overwrite existing generated module '{new_module_file}'. Pass --force.")
+
+    dependency_names = collect_dependency_names(method_node, definitions)
+    dependency_names.discard(class_name)
+    dependency_names.discard(method_name)
+    dependency_nodes = [stmt for name, stmt in definitions.items() if name in dependency_names]
+    required_imports = collect_required_import_names([method_node], dependency_nodes, set(import_bindings))
+    method_init_file = output_dir / "__init__.py"
+    method_exports = parse_package_exports(
+        method_init_file.read_text(encoding="utf-8") if method_init_file.exists() else ""
+    )
+    import_block = build_import_block(
+        imports,
+        source_text,
+        (module_file.parent / "__init__.py").exists(),
+        args.output_package,
+        required_imports,
+        method_exports,
+    )
+    dependency_block = render_dependency_blocks(definitions, source_text, dependency_names)
+    lines = source_text.splitlines(keepends=True)
+    method_start = statement_start_lineno(method_node)
+    method_block = "".join(lines[method_start - 1 : method_node.end_lineno])
+    helper_block = transform_function_block(
+        textwrap.dedent(method_block),
+        new_name=None,
+        keep_decorators=False,
+    )
+    new_module_text = compose_new_module_text(
+        source_path=module_file,
+        import_block=import_block,
+        dependency_block=dependency_block,
+        function_block=helper_block,
+    )
+
+    helper_args = _call_arguments(method_node.args)
+    wrapper_args = ast.unparse(method_node.args)
+    returns = f" -> {ast.unparse(method_node.returns)}" if method_node.returns is not None else ""
+    decorator = "    @staticmethod\n" if is_static else "    @classmethod\n" if is_classmethod else ""
+    async_prefix = "async " if isinstance(method_node, ast.AsyncFunctionDef) else ""
+    await_prefix = "await " if isinstance(method_node, ast.AsyncFunctionDef) else ""
+    wrapper = (
+        f"{decorator}    {async_prefix}def {method_name}({wrapper_args}){returns}:\n"
+        f"        return {await_prefix}{method_name}({helper_args})\n"
+    )
+    updated_source = "".join(lines[: method_start - 1]) + wrapper + "".join(lines[method_node.end_lineno :])
+    import_statement = compute_import = (
+        f"from .{args.output_package}.{helper_module_name} import {method_name}"
+        if (module_file.parent / "__init__.py").exists()
+        else f"from {args.output_package}.{helper_module_name} import {method_name}"
+    )
+    updated_source = insert_import(updated_source, import_statement)
+
+    init_file = output_dir / "__init__.py"
+    existing_init = init_file.read_text(encoding="utf-8") if init_file.exists() else ""
+    init_text = updated_package_exports(existing_init, method_name, module_name=helper_module_name)
+    file_changes = [
+        FileChange(module_file, True, source_text, updated_source),
+        FileChange(
+            new_module_file,
+            new_module_file.exists(),
+            new_module_file.read_text(encoding="utf-8") if new_module_file.exists() else "",
+            new_module_text,
+        ),
+        FileChange(init_file, init_file.exists(), existing_init, init_text),
+    ]
+    if not args.preview:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for change in file_changes:
+            change.path.write_text(change.after_text, encoding="utf-8")
+
+    return SplitResult(
+        module_file=module_file,
+        new_module_file=new_module_file,
+        function_name=method_name,
+        import_statement=compute_import,
+        module_text=updated_source,
+        new_module_text=new_module_text,
+        init_file=init_file,
+        init_text=init_text,
+        preview=args.preview,
+        file_changes=file_changes,
+        output_package=args.output_package,
+        preview_diffs=build_preview_diffs(file_changes),
+    )
+
+
+def _parse_method_target(target: str) -> tuple[str, str, str]:
+    parts = target.split(".")
+    if len(parts) < 3:
+        raise PySplitError("splitmethod target must look like package.module.ClassName.method_name.")
+    return ".".join(parts[:-2]), parts[-2], parts[-1]
+
+
+def _decorator_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Call):
+        return _decorator_name(node.func)
+    return ""
+
+
+def _is_overload_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    return any(_decorator_name(decorator) == "overload" for decorator in node.decorator_list)
+
+
+def _collect_module_bindings(
+    tree: ast.Module,
+) -> tuple[list[ast.stmt], dict[str, ast.stmt], dict[str, ast.stmt]]:
+    imports: list[ast.stmt] = []
+    import_bindings: dict[str, ast.stmt] = {}
+    definitions: dict[str, ast.stmt] = {}
+
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            imports.append(stmt)
+            for name in iter_imported_names(stmt):
+                import_bindings.setdefault(name, stmt)
+            continue
+
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) or not _is_overload_function(stmt):
+                definitions.setdefault(stmt.name, stmt)
+        elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for name in iter_assigned_names(stmt):
+                definitions.setdefault(name, stmt)
+
+    return imports, import_bindings, definitions
+
+
+def _call_arguments(args: ast.arguments) -> str:
+    names: list[str] = []
+    names.extend(arg.arg for arg in args.posonlyargs)
+    names.extend(arg.arg for arg in args.args)
+    if args.vararg is not None:
+        names.append(f"*{args.vararg.arg}")
+    names.extend(f"{arg.arg}={arg.arg}" for arg in args.kwonlyargs)
+    if args.kwarg is not None:
+        names.append(f"**{args.kwarg.arg}")
+    return ", ".join(names)
+
+
+def _camel_to_snake(name: str) -> str:
+    chars: list[str] = []
+    for index, char in enumerate(name):
+        if char.isupper() and index:
+            chars.append("_")
+        chars.append(char.lower())
+    return "".join(chars)
 
 
 def _looks_like_file_path(value: str | None) -> bool:
@@ -634,3 +1214,28 @@ def _supports_color() -> bool:
     if os.getenv("NO_COLOR"):
         return False
     return sys.stdout.isatty()
+
+
+def _function_kind_report(source_text: str, function_name: str) -> list[str]:
+    kinds = _function_kinds(source_text, function_name)
+    reports: list[str] = []
+    if kinds["async"]:
+        reports.append(f"Found async function: {function_name}")
+    if kinds["generator"]:
+        reports.append(f"Found generator function: {function_name}")
+    return reports
+
+
+def _function_kinds(source_text: str, function_name: str) -> dict[str, bool]:
+    try:
+        tree = ast.parse(source_text)
+    except SyntaxError:
+        return {"async": False, "generator": False}
+    for stmt in tree.body:
+        if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) or stmt.name != function_name:
+            continue
+        return {
+            "async": isinstance(stmt, ast.AsyncFunctionDef),
+            "generator": any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in ast.walk(stmt)),
+        }
+    return {"async": False, "generator": False}

@@ -21,13 +21,31 @@ def extract_lines(source_text: str, start_lineno: int, end_lineno: int) -> str:
     raise FunctionExtractionError(f"Could not find a top-level function at lines {start_lineno}-{end_lineno}.")
 
 
+def transform_function_block(function_block: str, *, new_name: str | None, keep_decorators: bool) -> str:
+    if new_name is not None and not new_name.isidentifier():
+        raise FunctionExtractionError(f"Invalid function name '{new_name}'.")
+
+    module = cst.parse_module(function_block)
+    if len(module.body) != 1 or not isinstance(module.body[0], cst.FunctionDef):
+        raise FunctionExtractionError("Could not transform extracted function block.")
+
+    function = module.body[0]
+    if new_name is not None:
+        function = function.with_changes(name=cst.Name(new_name))
+    if not keep_decorators:
+        function = function.with_changes(decorators=())
+    return module.code_for_node(function)
+
+
 def build_import_block(
     imports: list[ast.stmt],
     source_text: str,
     package_mode: bool,
     output_package: str,
     required_import_names: set[str],
+    package_exports: dict[str, str] | None = None,
 ) -> str:
+    package_exports = package_exports or {}
     lines = source_text.splitlines(keepends=True)
     blocks: list[str] = []
 
@@ -40,7 +58,7 @@ def build_import_block(
         if filtered is None:
             continue
         if isinstance(stmt, ast.ImportFrom) and stmt.module == output_package:
-            blocks.extend(_rewrite_package_import(filtered, package_mode, output_package))
+            blocks.extend(_rewrite_package_import(filtered, package_mode, output_package, package_exports))
             continue
         blocks.append(filtered)
 
@@ -60,8 +78,30 @@ def compose_new_module_text(
     return header + import_block + dependency_block + function_block
 
 
-def updated_package_exports(existing: str, function_name: str) -> str:
-    export_line = f"from .{function_name} import {function_name}\n"
+def append_to_module_text(existing_text: str, generated_text: str, function_name: str, module_file: Path) -> str:
+    try:
+        existing_tree = ast.parse(existing_text or "")
+    except SyntaxError as exc:
+        raise FunctionExtractionError(f"Could not parse existing module '{module_file}': {exc}") from exc
+
+    for stmt in existing_tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == function_name:
+            raise FunctionExtractionError(
+                f"Cannot append '{function_name}' to '{module_file}' because that function already exists."
+            )
+
+    import_lines, body_text = _split_generated_imports_and_body(generated_text)
+    merged = existing_text.rstrip()
+    if import_lines:
+        merged = _merge_import_lines(merged, import_lines)
+    if merged:
+        merged += "\n\n"
+    return merged + body_text.strip() + "\n"
+
+
+def updated_package_exports(existing: str, function_name: str, *, module_name: str | None = None) -> str:
+    module_name = module_name or function_name
+    export_line = f"from .{module_name} import {function_name}\n"
     lines = existing.splitlines(keepends=True)
 
     if export_line in lines:
@@ -86,6 +126,26 @@ def updated_package_exports_for_group(existing: str, group_module_name: str, fun
     filtered.append(export_line)
     filtered = sorted(set(filtered), key=str.casefold)
     return "".join(filtered)
+
+
+def parse_package_exports(init_text: str) -> dict[str, str]:
+    if not init_text.strip():
+        return {}
+    try:
+        tree = ast.parse(init_text)
+    except SyntaxError:
+        return {}
+
+    exports: dict[str, str] = {}
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.ImportFrom) or stmt.level != 1 or not stmt.module:
+            continue
+        for alias in stmt.names:
+            if alias.name == "*":
+                continue
+            bound_name = alias.asname or alias.name
+            exports[bound_name] = stmt.module
+    return exports
 
 
 def remove_function_block(source_text: str, start_lineno: int, end_lineno: int) -> str:
@@ -121,6 +181,19 @@ def compute_replacement_import(package_mode: bool, output_package: str, function
     return f"from {output_package} import {function_name}"
 
 
+def compute_module_import(
+    package_mode: bool,
+    module_path: str,
+    import_name: str,
+    *,
+    exported_name: str | None = None,
+) -> str:
+    alias = "" if exported_name is None or exported_name == import_name else f" as {exported_name}"
+    if package_mode:
+        return f"from .{module_path} import {import_name}{alias}"
+    return f"from {module_path} import {import_name}{alias}"
+
+
 def compute_group_import_statement(package_mode: bool, output_package: str, function_names: list[str]) -> str:
     names_str = ", ".join(sorted(function_names))
     if package_mode:
@@ -148,6 +221,14 @@ def validate_output_package(output_package: str) -> None:
         raise FunctionExtractionError(
             f"Invalid output package '{output_package}'. "
             "Use a dotted Python package path like 'modules' or 'generated'."
+        )
+
+
+def validate_output_module_path(module_path: str) -> None:
+    parts = module_path.split(".")
+    if not module_path or any(not part.isidentifier() for part in parts):
+        raise FunctionExtractionError(
+            f"Invalid output module '{module_path}'. Use a dotted Python module path like 'modules.geometry'."
         )
 
 
@@ -201,7 +282,12 @@ def _filter_import(stmt: ast.stmt, source_text: str, required_import_names: set[
     return f"from {module_path} import {names}"
 
 
-def _rewrite_package_import(import_text: str, package_mode: bool, output_package: str) -> list[str]:
+def _rewrite_package_import(
+    import_text: str,
+    package_mode: bool,
+    output_package: str,
+    package_exports: dict[str, str],
+) -> list[str]:
     stmt = ast.parse(import_text).body[0]
     if not isinstance(stmt, ast.ImportFrom):
         return [import_text]
@@ -209,17 +295,18 @@ def _rewrite_package_import(import_text: str, package_mode: bool, output_package
     rewritten: list[str] = []
     for alias in sorted(stmt.names, key=lambda item: item.name.casefold()):
         import_name = alias.name
+        module_name = package_exports.get(import_name, import_name)
         if alias.asname is None:
             if package_mode:
-                rewritten.append(f"from .{import_name} import {import_name}")
+                rewritten.append(f"from .{module_name} import {import_name}")
             else:
-                rewritten.append(f"from {output_package}.{import_name} import {import_name}")
+                rewritten.append(f"from {output_package}.{module_name} import {import_name}")
             continue
 
         if package_mode:
-            rewritten.append(f"from .{import_name} import {import_name} as {alias.asname}")
+            rewritten.append(f"from .{module_name} import {import_name} as {alias.asname}")
         else:
-            rewritten.append(f"from {output_package}.{import_name} import {import_name} as {alias.asname}")
+            rewritten.append(f"from {output_package}.{module_name} import {import_name} as {alias.asname}")
 
     return rewritten
 
@@ -377,3 +464,49 @@ def _normalize_rewritten_source(source_text: str) -> str:
 def _extract_source_range(source_text: str, start_lineno: int, end_lineno: int) -> str:
     lines = source_text.splitlines(keepends=True)
     return "".join(lines[start_lineno - 1 : end_lineno])
+
+
+def _split_generated_imports_and_body(generated_text: str) -> tuple[list[str], str]:
+    tree = ast.parse(generated_text)
+    lines = generated_text.splitlines(keepends=True)
+    import_lines: list[str] = []
+    body_start = 1
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+            body_start = (stmt.end_lineno or stmt.lineno) + 1
+            continue
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            import_lines.append("".join(lines[stmt.lineno - 1 : stmt.end_lineno]).rstrip())
+            body_start = (stmt.end_lineno or stmt.lineno) + 1
+            continue
+        break
+
+    body_text = "".join(lines[body_start - 1 :]).lstrip()
+    return import_lines, body_text
+
+
+def _merge_import_lines(existing_text: str, import_lines: list[str]) -> str:
+    existing_lines = existing_text.splitlines()
+    existing_imports = {line.strip() for line in existing_lines if line.strip().startswith(("import ", "from "))}
+    missing = [line for line in import_lines if line.strip() not in existing_imports]
+    if not missing:
+        return existing_text
+
+    insert_at = 0
+    try:
+        tree = ast.parse(existing_text or "")
+    except SyntaxError:
+        return "\n".join([*missing, existing_text]).strip()
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+            insert_at = stmt.end_lineno or stmt.lineno
+            continue
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            insert_at = stmt.end_lineno or stmt.lineno
+            continue
+        break
+
+    updated = existing_lines[:insert_at] + missing + existing_lines[insert_at:]
+    return "\n".join(updated).rstrip()

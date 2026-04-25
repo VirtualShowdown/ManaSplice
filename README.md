@@ -11,6 +11,7 @@
 - Splits one top-level function with `splitfunc`.
 - Splits every top-level function in a file, or every top-level function in each Python file in a directory, with `splitall`.
 - Checks whether a split is safe, and shows the planned changes without writing files, with `check`.
+- Emits JSON plans with `--json` for automation.
 - Copies the imports and top-level definitions the extracted function needs.
 - Maintains `modules/__init__.py` so rewritten files can use a single merged import line.
 
@@ -89,16 +90,33 @@ uv run manasplice --help
 manasplice splitfunc <module>.<function>
 manasplice splitall <path/to/file.py>
 manasplice splitall --dir <directory>
+manasplice splitall --dir <directory> --recursive
 manasplice check <module>.<function>
+manasplice check <module>.<function> --json
+manasplice check <module>.<function> --project-check
 manasplice check <path/to/file.py>
 manasplice check --dir <directory>
 manasplice undo [count]
+manasplice config init
+manasplice config show
 manasplice splitfunc <module>.<function> --preview
+manasplice splitfunc <module>.<function> --preview --json
 manasplice splitall <path/to/file.py> --preview
+manasplice splitall <path/to/file.py> --preview --json
 manasplice splitfunc <module>.<function> --validate
 manasplice splitall <path/to/file.py> --public-only --exclude main,_*
 manasplice splitall <path/to/file.py> --auto-group
+manasplice splitall <path/to/file.py> --group area,diameter,circumference --module geometry
 manasplice splitfunc <module>.<function> --output-package generated
+manasplice splitfunc <module>.<function> --output modules/geometry.py
+manasplice splitfunc <module>.<function> --name circle_area
+manasplice splitfunc <module>.<function> --into modules/geometry.py
+manasplice splitfunc <module>.<function> --format
+manasplice splitfunc <module>.<function> --require-clean-git
+manasplice splitfunc <module>.<function> --git-commit
+manasplice splitfunc <module>.<function> --keep-decorators
+manasplice splitfunc <module>.<function> --strip-decorators
+manasplice splitmethod <module>.<Class>.<method>
 manasplice splitfunc <module>.<function> --force
 ```
 
@@ -109,29 +127,73 @@ uv run manasplice splitfunc main.area
 uv run manasplice splitfunc package.utils.normalize_name
 uv run manasplice splitall main.py
 uv run manasplice splitall --dir app
+uv run manasplice splitall --dir app --recursive
 uv run manasplice check main.area
+uv run manasplice check main.area --project-check
 uv run manasplice check main.py --public-only --exclude main,_*
 uv run manasplice splitall main.py --preview
+uv run manasplice splitall main.py --preview --json
 uv run manasplice splitall main.py --public-only --exclude main,_*
 uv run manasplice splitall main.py --auto-group
+uv run manasplice splitall main.py --group area,diameter,circumference --module geometry
 uv run manasplice splitfunc main.area --validate
 uv run manasplice splitfunc main.area --output-package generated
+uv run manasplice splitfunc main.area --output modules/geometry.py
+uv run manasplice splitfunc main.area --into modules/geometry.py
+uv run manasplice splitfunc main.area --format
+uv run manasplice splitmethod services.UserService.normalize_name
 uv run manasplice undo
+```
+
+## Configuration
+
+ManaSplice reads `[tool.manasplice]` from the nearest `pyproject.toml` above `--cwd`.
+
+Create a starter config:
+
+```bash
+manasplice config init
+```
+
+Show the active config:
+
+```bash
+manasplice config show
+manasplice config show --json
+```
+
+Example:
+
+```toml
+[tool.manasplice]
+output_package = "modules"
+validate = true
+public_only = true
+exclude = ["main", "_*"]
+recursive = true
+format = "ruff"
 ```
 
 ## Notes
 
-- ManaSplice only moves top-level functions.
+- ManaSplice primarily moves top-level functions. `splitmethod` supports conservative class-method extraction by generating a forwarding wrapper and refusing methods without explicit `self`/`cls`.
 - `splitall` is literal: it will split every top-level function it finds, including helper functions and `main()` if present.
 - Use `check` for a no-write safety report without diffs.
+- Use `--json` with `check` or preview commands to get a machine-readable plan instead of human text and colored diffs.
 - Use `--preview` to inspect planned edits with a safety report and unified diffs before ManaSplice writes anything.
 - Use `--validate` to make ManaSplice parse the generated Python source before it writes changes.
-- Use `--include`, `--exclude`, and `--public-only` to make `splitall` selective instead of splitting every top-level function.
+- Use `--include`, `--exclude`, `--public-only`, and `--recursive` to make `splitall` selective instead of splitting every top-level function.
 - Use `--auto-group` to keep top-level functions that reference each other in the same generated module.
+- Use `--group ... --module ...` when architectural grouping should override call-graph grouping.
 - Use `--output-package` if you want generated modules somewhere other than `modules/`.
+- Use `--output`, `--name`, and `--into` to control the exact destination module, extracted function name, or append to an existing module.
+- Use `--keep-decorators` or `--strip-decorators` to control decorator handling for frameworks with registration side effects.
+- Use `--format` to run `ruff format` and `ruff check --fix` on changed Python files after writing.
+- Use `--require-clean-git` to refuse dirty working trees, or `--git-commit` to create a commit after a successful write.
 - ManaSplice refuses to overwrite an existing generated module unless you pass `--force`.
 - ManaSplice refuses splits that depend on mutable top-level globals, because copying those globals into a new module changes runtime state.
 - ManaSplice now refuses to split functions that participate in a local top-level dependency cycle, such as simple mutual recursion.
+- `check` reports async and generator functions explicitly.
 - Every non-preview split records rollback history in `.manasplice_history.json`, and `undo` replays the last recorded operation.
 - The generated `modules/` package is part of the rewritten code, not just scratch output.
 
