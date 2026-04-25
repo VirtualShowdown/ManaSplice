@@ -35,3 +35,4 @@ data/users.json
 # Editor and OS noise
 .DS_Store
 Thumbs.db
+test_repo

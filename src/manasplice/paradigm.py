@@ -3,13 +3,15 @@ from __future__ import annotations
 import ast
 import difflib
 import fnmatch
+import io
+import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 
 from .analysis import statement_start_lineno
 from .exceptions import PySplitError
 from .models import FileChange
-from .rewrite import extract_lines, validate_split_outputs
+from .rewrite import validate_split_outputs
 from .utils import read_python_source, write_text_preserving_newlines
 
 
@@ -52,7 +54,12 @@ def transform_module_to_oop(file_path: Path, *, options: ParadigmOptions | None 
     if _has_top_level_class(tree, class_name):
         raise PySplitError(f"Class '{class_name}' already exists in '{file_path}'.")
 
-    candidates = _collect_candidates(tree, options)
+    candidates = _collect_candidates(
+        tree,
+        options,
+        strict_oop=True,
+        max_lineno=_first_generated_marker_lineno(source_text),
+    )
     transformable = [candidate for candidate in candidates if not candidate.skip_reason]
     skipped = {candidate.node.name: candidate.skip_reason for candidate in candidates if candidate.skip_reason}
 
@@ -81,14 +88,19 @@ def transform_module_to_oop(file_path: Path, *, options: ParadigmOptions | None 
         skipped=skipped,
         preview=options.preview,
         file_changes=file_changes,
-        preview_diffs=_build_preview_diffs(file_changes),
+        preview_diffs=_build_preview_diffs(file_changes) if options.preview else [],
     )
 
 
 def transform_module_to_functional(file_path: Path, *, options: ParadigmOptions | None = None) -> ParadigmResult:
     options = options or ParadigmOptions()
     source_text, tree = _parse_source(file_path)
-    candidates = _collect_candidates(tree, options)
+    candidates = _collect_candidates(
+        tree,
+        options,
+        strict_oop=False,
+        max_lineno=_first_generated_marker_lineno(source_text),
+    )
     selected = [candidate for candidate in candidates if not candidate.skip_reason]
     skipped = {candidate.node.name: candidate.skip_reason for candidate in candidates if candidate.skip_reason}
 
@@ -114,7 +126,12 @@ def transform_module_to_functional(file_path: Path, *, options: ParadigmOptions 
 def transform_module_to_event_driven(file_path: Path, *, options: ParadigmOptions | None = None) -> ParadigmResult:
     options = options or ParadigmOptions()
     source_text, tree = _parse_source(file_path)
-    candidates = _collect_candidates(tree, options)
+    candidates = _collect_candidates(
+        tree,
+        options,
+        strict_oop=False,
+        max_lineno=_first_generated_marker_lineno(source_text),
+    )
     selected = [candidate for candidate in candidates if not candidate.skip_reason]
     skipped = {candidate.node.name: candidate.skip_reason for candidate in candidates if candidate.skip_reason}
 
@@ -233,7 +250,7 @@ def _write_paradigm_result(
         skipped=skipped,
         preview=options.preview,
         file_changes=file_changes,
-        preview_diffs=_build_preview_diffs(file_changes),
+        preview_diffs=_build_preview_diffs(file_changes) if options.preview else [],
     )
 
 
@@ -245,7 +262,13 @@ class _FunctionCandidate:
     skip_reason: str
 
 
-def _collect_candidates(tree: ast.Module, options: ParadigmOptions) -> list[_FunctionCandidate]:
+def _collect_candidates(
+    tree: ast.Module,
+    options: ParadigmOptions,
+    *,
+    strict_oop: bool,
+    max_lineno: int | None = None,
+) -> list[_FunctionCandidate]:
     candidates: list[_FunctionCandidate] = []
     include_patterns = options.include_patterns or []
     exclude_patterns = options.exclude_patterns or []
@@ -259,6 +282,8 @@ def _collect_candidates(tree: ast.Module, options: ParadigmOptions) -> list[_Fun
     for stmt in tree.body:
         if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
+        if max_lineno is not None and statement_start_lineno(stmt) >= max_lineno:
+            continue
         if _is_overload_function(stmt):
             continue
         if options.public_only and stmt.name.startswith("_"):
@@ -271,13 +296,11 @@ def _collect_candidates(tree: ast.Module, options: ParadigmOptions) -> list[_Fun
             raise PySplitError(f"Could not determine end line for function '{stmt.name}'.")
 
         skip_reason = ""
-        if stmt.decorator_list:
+        if strict_oop and stmt.decorator_list:
             skip_reason = "decorated functions are left unchanged"
-        elif stmt.name in overloaded_names:
+        elif strict_oop and stmt.name in overloaded_names:
             skip_reason = "overloaded functions are left unchanged"
-        elif _has_multiline_string_literal(stmt):
-            skip_reason = "functions with multiline string literals are left unchanged"
-        elif stmt.name in eager_references:
+        elif strict_oop and stmt.name in eager_references:
             skip_reason = "functions referenced during module initialization are left unchanged"
         candidates.append(
             _FunctionCandidate(
@@ -291,14 +314,13 @@ def _collect_candidates(tree: ast.Module, options: ParadigmOptions) -> list[_Fun
     return candidates
 
 
-def _has_multiline_string_literal(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    for child in ast.walk(node):
-        if isinstance(child, ast.Constant) and isinstance(child.value, str):
-            if getattr(child, "end_lineno", child.lineno) > child.lineno:
-                return True
-        if isinstance(child, ast.JoinedStr) and getattr(child, "end_lineno", child.lineno) > child.lineno:
-            return True
-    return False
+def _first_generated_marker_lineno(source_text: str) -> int | None:
+    marker_lines: list[int] = []
+    for marker in (FUNCTIONAL_MARKER, EVENT_MARKER):
+        index = source_text.find(marker)
+        if index >= 0:
+            marker_lines.append(source_text.count("\n", 0, index) + 1)
+    return min(marker_lines) if marker_lines else None
 
 
 def _collect_eager_top_level_references(tree: ast.Module) -> set[str]:
@@ -401,10 +423,11 @@ def _is_main_guard(stmt: ast.stmt) -> bool:
 
 
 def _build_class_block(source_text: str, candidates: list[_FunctionCandidate], class_name: str) -> str:
+    lines = source_text.splitlines(keepends=True)
     methods = []
     for candidate in candidates:
-        block = extract_lines(source_text, candidate.start_lineno, candidate.end_lineno).lstrip("\r\n").rstrip()
-        methods.append("    @staticmethod\n" + _indent(block, "    "))
+        block = "".join(lines[candidate.start_lineno - 1 : candidate.end_lineno]).lstrip("\r\n").rstrip()
+        methods.append("    @staticmethod\n" + _indent_function_block(block, "    "))
     return f"class {class_name}:\n" + "\n\n".join(methods) + "\n\n"
 
 
@@ -580,8 +603,25 @@ def _decorator_name(node: ast.expr) -> str:
     return ""
 
 
-def _indent(text: str, prefix: str) -> str:
-    return "".join(prefix + line if line.strip() else line for line in text.splitlines(keepends=True))
+def _indent_function_block(text: str, prefix: str) -> str:
+    string_body_lines = _multiline_string_body_lines(text)
+    return "".join(
+        line if line_number in string_body_lines or not line.strip() else prefix + line
+        for line_number, line in enumerate(text.splitlines(keepends=True), start=1)
+    )
+
+
+def _multiline_string_body_lines(text: str) -> set[int]:
+    skipped_lines: set[int] = set()
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+        for token in tokens:
+            if token.type != tokenize.STRING or token.end[0] <= token.start[0]:
+                continue
+            skipped_lines.update(range(token.start[0] + 1, token.end[0] + 1))
+    except tokenize.TokenError:
+        return set()
+    return skipped_lines
 
 
 def _normalize_rewritten_source(source_text: str) -> str:

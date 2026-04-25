@@ -913,7 +913,7 @@ def test_paradigm_oop_skips_functions_used_during_class_initialization(tmp_path:
         sys.modules.pop("main", None)
 
 
-def test_paradigm_oop_skips_functions_with_multiline_string_literals(tmp_path: Path) -> None:
+def test_paradigm_oop_preserves_multiline_string_literal_contents(tmp_path: Path) -> None:
     source = tmp_path / "main.py"
     original = (
         "def render_code():\n"
@@ -930,7 +930,8 @@ def test_paradigm_oop_skips_functions_with_multiline_string_literals(tmp_path: P
 
     assert exit_code == 0
     updated = source.read_text(encoding="utf-8")
-    assert "def render_code():\n    code = '''\\\ndef example():" in updated
+    assert "    @staticmethod\n    def render_code():" in updated
+    assert "code = '''\\\ndef example():" in updated
     assert "    @staticmethod\n    def plain(value):" in updated
 
     sys.path.insert(0, str(tmp_path))
@@ -1040,6 +1041,25 @@ def test_paradigm_facades_refuse_name_collisions_without_writing(tmp_path: Path,
     assert exit_code == 1
     assert source.read_text(encoding="utf-8") == original
     assert "name(s) already exist" in capsys.readouterr().out
+
+
+def test_paradigm_layered_facades_ignore_generated_helpers(tmp_path: Path) -> None:
+    source = tmp_path / "main.py"
+    source.write_text(
+        "def double(value):\n"
+        "    return value * 2\n",
+        encoding="utf-8",
+    )
+
+    functional_exit = main(["paradigm", "functional", "main.py", "--cwd", str(tmp_path), "--validate"])
+    event_exit = main(["paradigm", "event-driven", "main.py", "--cwd", str(tmp_path), "--validate"])
+
+    assert functional_exit == 0
+    assert event_exit == 0
+    updated = source.read_text(encoding="utf-8")
+    assert '"double": double' in updated
+    assert '"compose_functions": compose_functions' not in updated
+    assert '"pipe": pipe' not in updated
 
 
 def test_config_init_and_show(tmp_path: Path, capsys) -> None:
