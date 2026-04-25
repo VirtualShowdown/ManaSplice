@@ -276,6 +276,11 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     )
     paradigm.add_argument("--dir", dest="directory", help="Directory whose Python files should be restructured.")
     paradigm.add_argument("--cwd", default=".", help="Project root to resolve from. Defaults to current directory.")
+    paradigm.add_argument(
+        "--audit",
+        action="store_true",
+        help="Report transformability and risks without writing files.",
+    )
     paradigm.add_argument("--preview", action="store_true", help="Show planned changes without writing files.")
     paradigm.add_argument("--validate", action="store_true", help="Validate rewritten Python before writing files.")
     paradigm.add_argument("--recursive", action="store_true", help="Recurse into subdirectories.")
@@ -283,6 +288,17 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     paradigm.add_argument("--include", help="Comma-separated function name patterns to include, like 'run_*'.")
     paradigm.add_argument("--exclude", help="Comma-separated function name patterns to exclude, like 'main,_*'.")
     paradigm.add_argument("--public-only", action="store_true", help="Only restructure public top-level functions.")
+    paradigm.add_argument(
+        "--allow-broad-facade",
+        action="store_true",
+        help="Allow functional/event facades across multiple files. Prefer audit or explicit includes first.",
+    )
+    paradigm.add_argument(
+        "--verify-command",
+        action="append",
+        default=[],
+        help="Command to run after writing changes, such as 'python main.py'. Can be passed more than once.",
+    )
     paradigm.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     paradigm.add_argument("--format", nargs="?", const="ruff", default=config.get("format", None))
     paradigm.add_argument("--require-clean-git", action="store_true")
@@ -440,28 +456,34 @@ def main(argv: list[str] | None = None) -> int:
             _require_clean_git(cwd, args.require_clean_git)
             _preflight_git_commit(cwd, args.git_commit)
             paradigm_results = _handle_paradigm(args, cwd)
-            if not args.preview:
+            if not args.preview and not args.audit:
                 _format_file_changes(_paradigm_file_changes(paradigm_results), _normalize_format_tool(args.format))
             changed_count = sum(len(result.function_names) for result in paradigm_results)
-            if args.json:
-                _print_json(
-                    {
-                        "status": "ok",
-                        "style": args.style,
-                        "count": changed_count,
-                        "results": [_paradigm_result_to_json(result) for result in paradigm_results],
-                    }
-                )
-            else:
-                action = "Would restructure" if args.preview else "Restructured"
+            skipped_count = sum(len(result.skipped) for result in paradigm_results)
+            json_payload = {
+                "status": "ok",
+                "mode": "audit" if args.audit else "preview" if args.preview else "apply",
+                "style": args.style,
+                "count": changed_count,
+                "skipped_count": skipped_count,
+                "results": [_paradigm_result_to_json(result) for result in paradigm_results],
+            }
+            if not args.json:
+                action = "Audit found" if args.audit else "Would restructure" if args.preview else "Restructured"
                 print(f"{action} {changed_count} function(s) for {_normalize_paradigm_style(args.style)}.")
-            if changed_count and not args.preview:
+                if args.audit:
+                    print(f"Skipped {skipped_count} function(s) with safety reasons.")
+                    _print_paradigm_audit_guidance(_normalize_paradigm_style(args.style), len(paradigm_results))
+            if changed_count and not args.preview and not args.audit:
                 changes = _paradigm_file_changes(paradigm_results)
                 command = f"manasplice paradigm {_normalize_paradigm_style(args.style)}"
                 history_file = record_change_history(cwd, command, changes)
                 if not args.json:
                     print(f"Recorded rollback history: {history_file}")
+                _run_verification_commands(cwd, args.verify_command, emit_output=not args.json)
                 _git_commit_changes(cwd, args.git_commit, command, changes)
+            if args.json:
+                _print_json(json_payload)
             return 0
         if args.command == "undo":
             undo_count, history_file = rollback_last(Path(args.cwd), args.count)
@@ -582,10 +604,21 @@ def _handle_paradigm(args: argparse.Namespace, cwd: Path) -> list[ParadigmResult
         raise PySplitError("--class-name can only be used with one explicit Python file.")
 
     target_files = _resolve_paradigm_files(args.path, args.directory, cwd, recursive=args.recursive)
+    if (
+        style in {"functional", "event-driven"}
+        and len(target_files) > 1
+        and not args.preview
+        and not args.audit
+        and not args.allow_broad_facade
+    ):
+        raise PySplitError(
+            f"Refusing broad {style} facade generation across {len(target_files)} files by default. "
+            "Run with --audit first, use --include/--public-only to narrow the scope, or pass --allow-broad-facade."
+        )
     results: list[ParadigmResult] = []
     for file_path in target_files:
         options = ParadigmOptions(
-            preview=args.preview,
+            preview=args.preview or args.audit,
             class_name=args.class_name,
             validate=args.validate,
             include_patterns=_parse_patterns(args.include),
@@ -595,7 +628,7 @@ def _handle_paradigm(args: argparse.Namespace, cwd: Path) -> list[ParadigmResult
         result = _transform_module_for_style(file_path, style, options)
         results.append(result)
         if not args.json:
-            _print_paradigm_result(result, style=style, show_diffs=args.preview)
+            _print_paradigm_result(result, style=style, show_diffs=args.preview and not args.audit)
     return results
 
 
@@ -915,6 +948,15 @@ def _paradigm_file_changes(results: list[ParadigmResult]) -> list[FileChange]:
     return [change for result in results for change in result.file_changes]
 
 
+def _print_paradigm_audit_guidance(style: str, file_count: int) -> None:
+    if style in {"functional", "event-driven"} and file_count > 1:
+        print(
+            "Note: functional/event-driven modes add facade APIs. For broad writes, narrow the scope "
+            "or pass --allow-broad-facade intentionally."
+        )
+    print("Use --preview for diffs, --validate for syntax validation, and --verify-command for project smoke checks.")
+
+
 def _parse_patterns(raw_patterns: str | list | None) -> list[str]:
     if raw_patterns is None:
         return []
@@ -1116,6 +1158,22 @@ def _git_commit_changes(cwd: Path, enabled: bool, message: str, changes: list[Fi
     if staged.returncode == 0:
         return
     subprocess.run(["git", "commit", "--no-verify", "-m", message], cwd=cwd, check=True)
+
+
+def _run_verification_commands(cwd: Path, commands: list[str], *, emit_output: bool) -> None:
+    for command in commands:
+        if emit_output:
+            print(f"Running verification command: {command}")
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            shell=True,
+            check=False,
+            capture_output=not emit_output,
+            text=not emit_output,
+        )
+        if result.returncode != 0:
+            raise PySplitError(f"Verification command failed with exit code {result.returncode}: {command}")
 
 
 def _run_project_checks(results: list[SplitResult | GroupSplitResult], cwd: Path, *, emit_output: bool) -> None:

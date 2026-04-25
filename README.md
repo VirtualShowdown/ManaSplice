@@ -125,6 +125,8 @@ manasplit paradigm event-driven <path/to/file.py>
 manasplit paradigm procedural <path/to/file.py>
 manasplit paradigm OOP --dir <directory> --recursive
 manasplit paradigm OOP <path/to/file.py> --preview
+manasplit paradigm OOP --dir <directory> --recursive --audit --json
+manasplit paradigm OOP <path/to/file.py> --verify-command "python main.py"
 ```
 
 Examples:
@@ -154,6 +156,8 @@ uv run manasplit paradigm functional main.py
 uv run manasplit paradigm event-driven main.py
 uv run manasplit paradigm procedural main.py
 uv run manasplit paradigm OOP main.py --preview
+uv run manasplit paradigm OOP --dir src --recursive --audit
+uv run manasplit paradigm OOP main.py --verify-command "python main.py"
 uv run manasplice undo
 ```
 
@@ -193,6 +197,9 @@ format = "ruff"
 - `paradigm functional` adds a generated functional facade with `FUNCTIONAL_API`, `pipe`, and `compose_functions` without changing existing function definitions.
 - `paradigm event-driven` adds `EVENT_HANDLERS` and `dispatch_event` so functions can be invoked through event names.
 - `paradigm procedural` flattens ManaSplice-generated OOP staticmethod classes back into top-level functions while preserving a compatibility class.
+- Use `paradigm --audit` for a no-write transformability report with skip reasons and JSON support.
+- Broad `functional` and `event-driven` facade generation across multiple files is refused by default. Audit first, narrow the scope, or pass `--allow-broad-facade` when the generated facade APIs are intentional.
+- Use `paradigm --verify-command "..."` to run project-specific smoke checks after a successful write.
 - `splitall` is literal: it will split every top-level function it finds, including helper functions and `main()` if present.
 - Use `check` for a no-write safety report without diffs.
 - Use `--json` with `check` or preview commands to get a machine-readable plan instead of human text and colored diffs.
