@@ -841,6 +841,85 @@ def test_paradigm_semantic_oop_builds_instance_class_with_state(tmp_path: Path, 
         sys.modules.pop("pricing", None)
 
 
+def test_paradigm_semantic_oop_infers_record_owner_class(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "cart.py"
+    source.write_text(
+        "def create_cart():\n"
+        "    return {'items': []}\n\n"
+        "def cart_add_item(cart, item):\n"
+        "    cart['items'].append(item)\n\n"
+        "def cart_total(cart):\n"
+        "    return sum(cart['items'])\n\n"
+        "def cart_checkout(cart, discount=0):\n"
+        "    return cart_total(cart) - discount\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["paradigm", "OOP", "cart.py", "--cwd", str(tmp_path), "--semantic", "--validate"])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "from dataclasses import dataclass, field" in updated
+    assert "@dataclass(slots=True)\nclass Cart:" in updated
+    assert "items: object = field(default_factory=list)" in updated
+    assert "def to_mapping(self):" in updated
+    assert "def add_item(self, item):" in updated
+    assert "self.items.append(item)" in updated
+    assert "def total(self):" in updated
+    assert "return sum(self.items)" in updated
+    assert "return self.total() - discount" in updated
+    assert "def create_cart():\n    return Cart(items=[])" in updated
+    assert "def cart_total(cart):\n    return _as_cart(cart).total()" in updated
+    assert "Restructured 4 function(s) for OOP." in capsys.readouterr().out
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import cart
+
+        shopping_cart = cart.create_cart()
+        assert isinstance(shopping_cart, cart.Cart)
+        cart.cart_add_item(shopping_cart, 10)
+        cart.cart_add_item(shopping_cart, 5)
+        assert cart.cart_total(shopping_cart) == 15
+        assert cart.cart_checkout({"items": [20, 3]}, discount=5) == 18
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("cart", None)
+
+
+def test_paradigm_semantic_oop_infers_entity_base_for_record_id(tmp_path: Path) -> None:
+    source = tmp_path / "account.py"
+    source.write_text(
+        "def create_account(account_id):\n"
+        "    return {'id': account_id, 'balance': 0}\n\n"
+        "def account_deposit(account, amount):\n"
+        "    account['balance'] += amount\n\n"
+        "def account_summary(account):\n"
+        "    return f\"{account['id']}:{account['balance']}\"\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["paradigm", "OOP", "account.py", "--cwd", str(tmp_path), "--semantic", "--validate"])
+
+    assert exit_code == 0
+    updated = source.read_text(encoding="utf-8")
+    assert "@dataclass(slots=True)\nclass AccountEntity:" in updated
+    assert "id: object | None = None" in updated
+    assert "@dataclass(slots=True)\nclass Account(AccountEntity):" in updated
+    assert "balance: object = 0" in updated
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        import account
+
+        bank_account = account.create_account("a1")
+        account.account_deposit(bank_account, 25)
+        assert account.account_summary(bank_account) == "a1:25"
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("account", None)
+
+
 def test_paradigm_semantic_oop_skips_global_mutation(tmp_path: Path, capsys) -> None:
     source = tmp_path / "pricing.py"
     original = (
@@ -870,10 +949,30 @@ def test_paradigm_semantic_rejects_non_oop_styles(tmp_path: Path, capsys) -> Non
     assert "--semantic is currently only supported with paradigm OOP" in capsys.readouterr().out
 
 
+def test_paradigm_semantic_oop_skips_low_signal_main_module(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "main.py"
+    original = (
+        "ROOT = 'app'\n\n"
+        "def load_config():\n"
+        "    return ROOT\n\n"
+        "def main():\n"
+        "    return load_config()\n"
+    )
+    source.write_text(original, encoding="utf-8")
+
+    exit_code = main(["paradigm", "OOP", "main.py", "--cwd", str(tmp_path), "--semantic", "--validate"])
+
+    assert exit_code == 0
+    assert source.read_text(encoding="utf-8") == original
+    output = capsys.readouterr().out
+    assert "entrypoint and test modules are left procedural unless --class-name is explicit" in output
+    assert "Restructured 0 function(s) for OOP." in output
+
+
 def test_paradigm_oop_defaults_to_recursive_project_directory(tmp_path: Path) -> None:
     package = tmp_path / "app"
     package.mkdir()
-    (package / "service.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    (package / "service.py").write_text("VALUE = 1\n\n\ndef run():\n    return VALUE\n", encoding="utf-8")
     hidden = tmp_path / ".venv"
     hidden.mkdir()
     (hidden / "ignored.py").write_text("def ignored():\n    return 1\n", encoding="utf-8")
@@ -937,8 +1036,8 @@ def test_ignore_marks_folder_and_run_skips_it(tmp_path: Path) -> None:
     ignored.mkdir(parents=True)
     service = app / "service.py"
     legacy = ignored / "legacy_service.py"
-    service.write_text("def run():\n    return 1\n", encoding="utf-8")
-    legacy.write_text("def legacy_run():\n    return 2\n", encoding="utf-8")
+    service.write_text("VALUE = 1\n\n\ndef run():\n    return VALUE\n", encoding="utf-8")
+    legacy.write_text("VALUE = 2\n\n\ndef legacy_run():\n    return VALUE\n", encoding="utf-8")
 
     ignore_exit = main(["ignore", "--path", "app/legacy", "--cwd", str(tmp_path)])
     run_exit = main(["run", "--cwd", str(tmp_path)])
@@ -948,6 +1047,116 @@ def test_ignore_marks_folder_and_run_skips_it(tmp_path: Path) -> None:
     assert (ignored / ".msignore").exists()
     assert "class ServiceService:" in service.read_text(encoding="utf-8")
     assert "class LegacyServiceService:" not in legacy.read_text(encoding="utf-8")
+
+
+def test_paradigm_layered_generates_architecture_boundaries(tmp_path: Path, capsys) -> None:
+    (tmp_path / "orders.py").write_text("def create_order():\n    return {'id': 'o1'}\n", encoding="utf-8")
+
+    exit_code = main(["paradigm", "layered", "--cwd", str(tmp_path), "--validate"])
+
+    assert exit_code == 0
+    pyproject_text = (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'target_paradigm = "layered"' in pyproject_text
+    assert 'contexts = ["orders"]' in pyproject_text
+    context_root = tmp_path / "contexts" / "orders"
+    entities = (context_root / "domain" / "entities.py").read_text(encoding="utf-8")
+    events = (context_root / "domain" / "events.py").read_text(encoding="utf-8")
+    services = (context_root / "application" / "services.py").read_text(encoding="utf-8")
+    ports = (context_root / "application" / "ports.py").read_text(encoding="utf-8")
+    repositories = (context_root / "infrastructure" / "repositories.py").read_text(encoding="utf-8")
+    controllers = (context_root / "presentation" / "controllers.py").read_text(encoding="utf-8")
+    event_bus = (tmp_path / "shared" / "event_bus.py").read_text(encoding="utf-8")
+    pipeline = (tmp_path / "shared" / "pipeline.py").read_text(encoding="utf-8")
+
+    assert "class OrdersAggregate(OrdersEntity):" in entities
+    assert "events: tuple[OrdersDomainEvent, ...]" in entities
+    assert "class OrdersDomainEvent:" in events
+    assert "repository: OrdersRepository" in services
+    assert "event_bus: EventBus[OrdersDomainEvent]" in services
+    assert "from .ports import OrdersRepository" in services
+    assert "from ..infrastructure.repositories import OrdersRepository" not in services
+    assert "class OrdersRepository(Protocol):" in ports
+    assert "class InMemoryOrdersRepository(OrdersRepository):" in repositories
+    assert "class OrdersController:" in controllers
+    assert "class EventBus(Generic[EventT]):" in event_bus
+    assert "@dataclass(frozen=True, slots=True)\nclass Pipeline" in pipeline
+    output = capsys.readouterr().out
+    assert "Restructured 1 context(s) for layered." in output
+    assert "12 file change(s) needed." in output
+
+
+def test_run_enforces_configured_layered_architecture(tmp_path: Path, capsys) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.manasplice]\n"
+        'target_paradigm = "layered"\n'
+        'contexts = ["billing"]\n'
+        "validate = true\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["run", "--cwd", str(tmp_path)])
+
+    assert exit_code == 0
+    assert (tmp_path / "contexts" / "billing" / "domain" / "entities.py").exists()
+    assert (tmp_path / "contexts" / "billing" / "application" / "services.py").exists()
+    assert (tmp_path / "contexts" / "billing" / "application" / "ports.py").exists()
+    assert (tmp_path / "contexts" / "billing" / "infrastructure" / "repositories.py").exists()
+    assert (tmp_path / "contexts" / "billing" / "presentation" / "controllers.py").exists()
+    assert (tmp_path / "shared" / "event_bus.py").exists()
+    assert (tmp_path / "shared" / "pipeline.py").exists()
+
+    capsys.readouterr()
+    check_exit = main(["run", "--cwd", str(tmp_path), "--check"])
+
+    assert check_exit == 0
+    output = capsys.readouterr().out
+    assert "Checked 1 context(s) for layered." in output
+    assert "0 file change(s) needed." in output
+
+
+def test_layered_check_reports_dependency_direction_violations(tmp_path: Path, capsys) -> None:
+    domain = tmp_path / "contexts" / "orders" / "domain"
+    domain.mkdir(parents=True)
+    (domain / "entities.py").write_text(
+        "from contexts.orders.infrastructure.repositories import InMemoryOrdersRepository\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.manasplice]\n"
+        'target_paradigm = "layered"\n'
+        'contexts = ["orders"]\n',
+        encoding="utf-8",
+    )
+
+    exit_code = main(["run", "--cwd", str(tmp_path), "--check"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert (
+        "Skipped contexts\\orders\\domain\\entities.py:1" in output
+        or "Skipped contexts/orders/domain/entities.py:1" in output
+    )
+    assert "domain layer must not import infrastructure layer" in output
+
+
+def test_layered_check_reports_bounded_context_violations(tmp_path: Path, capsys) -> None:
+    app = tmp_path / "contexts" / "orders" / "application"
+    app.mkdir(parents=True)
+    (app / "services.py").write_text(
+        "from contexts.billing.domain.entities import BillingAggregate\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.manasplice]\n"
+        'target_paradigm = "layered"\n'
+        'contexts = ["orders", "billing"]\n',
+        encoding="utf-8",
+    )
+
+    exit_code = main(["run", "--cwd", str(tmp_path), "--check"])
+
+    assert exit_code == 0
+    assert "bounded context 'orders' must not import context 'billing'" in capsys.readouterr().out
 
 
 def test_paradigm_oop_skips_decorated_and_overloaded_functions(tmp_path: Path, capsys) -> None:

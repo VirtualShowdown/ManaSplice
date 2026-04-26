@@ -25,6 +25,18 @@ class _SemanticFunction:
     skip_reason: str
 
 
+@dataclass(slots=True)
+class _RecordGroup:
+    prefix: str
+    class_name: str
+    entity_base_name: str
+    instance_arg: str
+    methods: list[_SemanticFunction]
+    factory: _SemanticFunction | None
+    fields: list[str]
+    field_defaults: dict[str, ast.expr]
+
+
 def transform_module_to_semantic_oop(file_path: Path, *, options: ParadigmOptions | None = None) -> ParadigmResult:
     options = options or ParadigmOptions()
     source_text = read_python_source(file_path)
@@ -61,13 +73,68 @@ def transform_module_to_semantic_oop(file_path: Path, *, options: ParadigmOption
             preview_diffs=[],
         )
 
+    record_groups = _infer_record_groups(selected, class_name if options.class_name else None)
+    if record_groups:
+        for group in record_groups:
+            if _has_top_level_name(tree, group.class_name):
+                raise PySplitError(f"Class '{group.class_name}' already exists in '{file_path}'.")
+            if group.entity_base_name and _has_top_level_name(tree, group.entity_base_name):
+                raise PySplitError(f"Class '{group.entity_base_name}' already exists in '{file_path}'.")
+            adapter_name = _record_adapter_name(group.prefix)
+            if _has_top_level_name(tree, adapter_name):
+                raise PySplitError(f"Name '{adapter_name}' already exists in '{file_path}'.")
+
+        grouped_candidates = [candidate for group in record_groups for candidate in _record_group_candidates(group)]
+        grouped_names = {candidate.node.name for candidate in grouped_candidates}
+        skipped.update(
+            {
+                candidate.node.name: "no cohesive record-style class could be inferred"
+                for candidate in selected
+                if candidate.node.name not in grouped_names
+            }
+        )
+        updated_source = _rewrite_record_oop_source(source_text, tree, record_groups)
+        file_changes = [FileChange(file_path, True, source_text, updated_source)]
+        if options.validate:
+            validate_split_outputs(file_changes)
+        if not options.preview:
+            write_text_preserving_newlines(file_path, updated_source)
+
+        return ParadigmResult(
+            module_file=file_path,
+            class_name=", ".join(group.class_name for group in record_groups),
+            function_names=[candidate.node.name for candidate in grouped_candidates],
+            skipped=skipped,
+            preview=options.preview,
+            file_changes=file_changes,
+            preview_diffs=_build_preview_diffs(file_changes) if options.preview else [],
+        )
+
     top_level_state = _top_level_state_names(tree)
-    method_names = {candidate.node.name for candidate in selected}
-    state_names = _infer_instance_state(selected, top_level_state)
+    service_candidates, service_skips = _select_service_candidates(
+        selected,
+        top_level_state,
+        file_path=file_path,
+        explicit_class_name=bool(options.class_name),
+    )
+    skipped.update(service_skips)
+    if not service_candidates:
+        return ParadigmResult(
+            module_file=file_path,
+            class_name=class_name,
+            function_names=[],
+            skipped=skipped,
+            preview=options.preview,
+            file_changes=[],
+            preview_diffs=[],
+        )
+
+    method_names = {candidate.node.name for candidate in service_candidates}
+    state_names = _infer_instance_state(service_candidates, top_level_state)
     updated_source = _rewrite_semantic_oop_source(
         source_text,
         tree,
-        selected,
+        service_candidates,
         class_name=class_name,
         instance_name=instance_name,
         method_names=method_names,
@@ -82,7 +149,7 @@ def transform_module_to_semantic_oop(file_path: Path, *, options: ParadigmOption
     return ParadigmResult(
         module_file=file_path,
         class_name=class_name,
-        function_names=[candidate.node.name for candidate in selected],
+        function_names=[candidate.node.name for candidate in service_candidates],
         skipped=skipped,
         preview=options.preview,
         file_changes=file_changes,
@@ -147,6 +214,268 @@ def _collect_semantic_candidates(
         )
 
     return candidates
+
+
+def _infer_record_groups(candidates: list[_SemanticFunction], explicit_class_name: str | None) -> list[_RecordGroup]:
+    by_prefix: dict[str, list[_SemanticFunction]] = {}
+    factories: dict[str, _SemanticFunction] = {}
+    for candidate in candidates:
+        node = candidate.node
+        if isinstance(node, ast.AsyncFunctionDef):
+            continue
+        if node.name.startswith("create_"):
+            prefix = node.name.removeprefix("create_")
+            if prefix and _returned_dict_fields(node):
+                factories[prefix] = candidate
+            continue
+        prefix, method_name = _record_method_parts(node)
+        if prefix and method_name:
+            by_prefix.setdefault(prefix, []).append(candidate)
+
+    groups: list[_RecordGroup] = []
+    for prefix, methods in sorted(by_prefix.items()):
+        fields = _record_fields(methods)
+        factory = factories.get(prefix)
+        field_defaults = _returned_dict_fields(factory.node) if factory is not None else {}
+        all_fields = sorted(fields | set(field_defaults))
+        if len(methods) < 2 and factory is None:
+            continue
+        if not all_fields:
+            continue
+        class_name = explicit_class_name if explicit_class_name and len(by_prefix) == 1 else _pascal_name(prefix)
+        entity_base_name = f"{class_name}Entity" if "id" in all_fields else ""
+        groups.append(
+            _RecordGroup(
+                prefix=prefix,
+                class_name=class_name,
+                entity_base_name=entity_base_name,
+                instance_arg=prefix,
+                methods=methods,
+                factory=factory,
+                fields=all_fields,
+                field_defaults=field_defaults,
+            )
+        )
+    return groups
+
+
+def _record_method_parts(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, str]:
+    if "_" not in node.name or not node.args.args:
+        return "", ""
+    prefix, method_name = node.name.split("_", 1)
+    if node.args.args[0].arg != prefix:
+        return "", ""
+    return prefix, method_name
+
+
+def _record_fields(candidates: list[_SemanticFunction]) -> set[str]:
+    fields: set[str] = set()
+    for candidate in candidates:
+        instance_arg = candidate.node.args.args[0].arg
+        for node in ast.walk(candidate.node):
+            field_name = _string_subscript_field(node, instance_arg)
+            if field_name:
+                fields.add(field_name)
+    return fields
+
+
+def _returned_dict_fields(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, ast.expr]:
+    for statement in node.body:
+        if not isinstance(statement, ast.Return) or not isinstance(statement.value, ast.Dict):
+            continue
+        fields: dict[str, ast.expr] = {}
+        for key, value in zip(statement.value.keys, statement.value.values, strict=False):
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                fields[key.value] = value
+        return fields
+    return {}
+
+
+def _rewrite_record_oop_source(source_text: str, tree: ast.Module, groups: list[_RecordGroup]) -> str:
+    candidates = sorted(
+        [candidate for group in groups for candidate in _record_group_candidates(group)],
+        key=lambda candidate: candidate.start_lineno,
+    )
+    replacements = {
+        candidate.node.name: _build_record_wrapper(candidate.node, group)
+        for group in groups
+        for candidate in _record_group_candidates(group)
+    }
+    lines = source_text.splitlines(keepends=True)
+    class_block = "\n".join(_build_record_class_block(group).rstrip() for group in groups) + "\n\n"
+    insertion_lineno = _generated_class_insertion_lineno(tree, len(lines))
+
+    output: list[str] = []
+    cursor = 1
+    inserted_class = False
+    for candidate in candidates:
+        if not inserted_class and cursor <= insertion_lineno <= candidate.start_lineno:
+            output.extend(lines[cursor - 1 : insertion_lineno - 1])
+            output.append(class_block)
+            cursor = insertion_lineno
+            inserted_class = True
+        output.extend(lines[cursor - 1 : candidate.start_lineno - 1])
+        output.append(replacements[candidate.node.name])
+        cursor = candidate.end_lineno + 1
+    if not inserted_class:
+        output.extend(lines[cursor - 1 : insertion_lineno - 1])
+        output.append(class_block)
+        cursor = insertion_lineno
+    output.extend(lines[cursor - 1 :])
+
+    return _normalize_rewritten_source("".join(output))
+
+
+def _record_group_candidates(group: _RecordGroup) -> list[_SemanticFunction]:
+    return [*([group.factory] if group.factory is not None else []), *group.methods]
+
+
+def _build_record_class_block(group: _RecordGroup) -> str:
+    parts = ["from dataclasses import dataclass, field", "", SEMANTIC_OOP_MARKER]
+    if group.entity_base_name:
+        parts.extend(
+            [
+                "@dataclass(slots=True)",
+                f"class {group.entity_base_name}:",
+                "    id: object | None = None",
+                "",
+            ]
+        )
+    base_suffix = f"({group.entity_base_name})" if group.entity_base_name else ""
+    parts.extend(["@dataclass(slots=True)", f"class {group.class_name}{base_suffix}:"])
+    for field_name in group.fields:
+        if group.entity_base_name and field_name == "id":
+            continue
+        parts.append(f"    {_attribute_name(field_name)}: object = {_field_default_source(group, field_name)}")
+    parts.append("")
+    parts.append("    @classmethod")
+    parts.append("    def from_mapping(cls, data):")
+    parts.append(f"        values = {{{', '.join(repr(field) for field in group.fields)}}}")
+    parts.append("        return cls(**{field_name: data[field_name] for field_name in values if field_name in data})")
+    parts.append("")
+    parts.append("    def to_mapping(self):")
+    mapping_items = ", ".join(f"{field!r}: self.{_attribute_name(field)}" for field in group.fields)
+    parts.append(f"        return {{{mapping_items}}}")
+    parts.append("")
+    for candidate in group.methods:
+        method_source = _build_record_method_source(candidate.node, group)
+        parts.extend("    " + line if line else "" for line in method_source.splitlines())
+        parts.append("")
+    parts.append("")
+    parts.append(f"def {_record_adapter_name(group.prefix)}(value):")
+    parts.append(
+        f"    return value if isinstance(value, {group.class_name}) "
+        f"else {group.class_name}.from_mapping(value)"
+    )
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def _field_default_source(group: _RecordGroup, field_name: str) -> str:
+    default = group.field_defaults.get(field_name)
+    if isinstance(default, ast.List) and not default.elts:
+        return "field(default_factory=list)"
+    if isinstance(default, ast.Dict) and not default.keys:
+        return "field(default_factory=dict)"
+    if isinstance(default, ast.Set) and not default.elts:
+        return "field(default_factory=set)"
+    if default is not None:
+        return ast.unparse(default)
+    return "None"
+
+
+def _build_record_method_source(node: ast.FunctionDef | ast.AsyncFunctionDef, group: _RecordGroup) -> str:
+    method_node = copy.deepcopy(node)
+    method_node.name = method_node.name.removeprefix(f"{group.prefix}_")
+    method_node.decorator_list = []
+    method_node.args.args = [ast.arg(arg="self"), *method_node.args.args[1:]]
+    method_names = {
+        candidate.node.name: candidate.node.name.removeprefix(f"{group.prefix}_") for candidate in group.methods
+    }
+    transformer = _RecordMethodTransformer(
+        instance_arg=group.instance_arg,
+        fields=set(group.fields),
+        method_names=method_names,
+    )
+    method_node = transformer.visit(method_node)
+    ast.fix_missing_locations(method_node)
+    return ast.unparse(method_node)
+
+
+def _build_record_wrapper(node: ast.FunctionDef | ast.AsyncFunctionDef, group: _RecordGroup) -> str:
+    if group.factory is not None and node.name == group.factory.node.name:
+        signature = ast.unparse(node.args)
+        return f"def {node.name}({signature}):\n    return {_record_factory_call(group.factory.node, group)}\n\n"
+    signature = ast.unparse(node.args)
+    returns = f" -> {ast.unparse(node.returns)}" if node.returns is not None else ""
+    instance_arg = node.args.args[0].arg
+    method_name = node.name.removeprefix(f"{group.prefix}_")
+    call_args = _call_arguments_without_first(node.args)
+    call_suffix = f"({call_args})" if call_args else "()"
+    return (
+        f"def {node.name}({signature}){returns}:\n"
+        f"    return {_record_adapter_name(group.prefix)}({instance_arg}).{method_name}{call_suffix}\n\n"
+    )
+
+
+def _record_factory_call(node: ast.FunctionDef | ast.AsyncFunctionDef, group: _RecordGroup) -> str:
+    fields = _returned_dict_fields(node)
+    args = ", ".join(f"{_attribute_name(field)}={ast.unparse(value)}" for field, value in fields.items())
+    return f"{group.class_name}({args})"
+
+
+def _record_adapter_name(prefix: str) -> str:
+    return f"_as_{prefix}"
+
+
+class _RecordMethodTransformer(ast.NodeTransformer):
+    def __init__(self, *, instance_arg: str, fields: set[str], method_names: dict[str, str]) -> None:
+        self._instance_arg = instance_arg
+        self._fields = fields
+        self._method_names = method_names
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        visited = self.generic_visit(node)
+        if (
+            isinstance(visited, ast.Call)
+            and isinstance(visited.func, ast.Name)
+            and visited.func.id in self._method_names
+            and visited.args
+            and isinstance(visited.args[0], ast.Name)
+            and visited.args[0].id == self._instance_arg
+        ):
+            visited.func = ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr=self._method_names[visited.func.id],
+                ctx=ast.Load(),
+            )
+            visited.args = visited.args[1:]
+        return visited
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        visited = self.generic_visit(node)
+        field_name = _string_subscript_field(visited, self._instance_arg)
+        if isinstance(visited, ast.Subscript) and field_name and field_name in self._fields:
+            return ast.copy_location(
+                ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=_attribute_name(field_name),
+                    ctx=visited.ctx,
+                ),
+                visited,
+            )
+        return visited
+
+
+def _string_subscript_field(node: ast.AST, instance_arg: str) -> str:
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == instance_arg
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    ):
+        return node.slice.value
+    return ""
 
 
 def _rewrite_semantic_oop_source(
@@ -289,6 +618,99 @@ def _infer_instance_state(candidates: list[_SemanticFunction], top_level_state: 
                 if node.id in top_level_state and node.id not in local_names:
                     used_state.add(node.id)
     return sorted(used_state)
+
+
+def _select_service_candidates(
+    candidates: list[_SemanticFunction],
+    top_level_state: set[str],
+    *,
+    file_path: Path,
+    explicit_class_name: bool,
+) -> tuple[list[_SemanticFunction], dict[str, str]]:
+    if explicit_class_name:
+        return candidates, {}
+
+    if _is_low_signal_oop_module(file_path):
+        return (
+            [],
+            {
+                candidate.node.name: "entrypoint and test modules are left procedural unless --class-name is explicit"
+                for candidate in candidates
+            },
+        )
+
+    stateful_names = {
+        candidate.node.name
+        for candidate in candidates
+        if _function_uses_top_level_state(candidate.node, top_level_state)
+    }
+    if not stateful_names:
+        return (
+            [],
+            {
+                candidate.node.name: "no cohesive instance state or domain object ownership could be inferred"
+                for candidate in candidates
+            },
+        )
+
+    candidate_names = {candidate.node.name for candidate in candidates}
+    call_graph = {
+        candidate.node.name: _called_candidate_names(candidate.node, candidate_names)
+        for candidate in candidates
+    }
+    selected_names = set(stateful_names)
+    changed = True
+    while changed:
+        changed = False
+        for name, called_names in call_graph.items():
+            if name in selected_names:
+                missing_callees = called_names - selected_names
+                if missing_callees:
+                    selected_names.update(missing_callees)
+                    changed = True
+            elif called_names & selected_names:
+                selected_names.add(name)
+                changed = True
+
+    selected = [candidate for candidate in candidates if candidate.node.name in selected_names]
+    skipped = {
+        candidate.node.name: "function is not part of the inferred stateful service boundary"
+        for candidate in candidates
+        if candidate.node.name not in selected_names
+    }
+    return selected, skipped
+
+
+def _function_uses_top_level_state(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    top_level_state: set[str],
+) -> bool:
+    local_names = _function_local_names(node)
+    return any(
+        isinstance(child, ast.Name)
+        and isinstance(child.ctx, ast.Load)
+        and child.id in top_level_state
+        and child.id not in local_names
+        for child in ast.walk(node)
+    )
+
+
+def _called_candidate_names(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    candidate_names: set[str],
+) -> set[str]:
+    return {
+        child.func.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Name)
+        and child.func.id in candidate_names
+    }
+
+
+def _is_low_signal_oop_module(file_path: Path) -> bool:
+    stem = file_path.stem
+    return stem == "main" or stem.startswith("test_") or stem.endswith("_test")
 
 
 def _top_level_state_names(tree: ast.Module) -> set[str]:
@@ -434,13 +856,23 @@ def _call_arguments(args: ast.arguments) -> str:
     return ", ".join(names)
 
 
+def _call_arguments_without_first(args: ast.arguments) -> str:
+    call_arguments = _call_arguments(args)
+    names = call_arguments.split(", ") if call_arguments else []
+    return ", ".join(names[1:])
+
+
 def _default_class_name(file_path: Path) -> str:
     stem = file_path.stem
     if stem == "__init__":
         stem = file_path.parent.name
-    words = [word for word in stem.replace("-", "_").split("_") if word]
-    base = "".join(word[:1].upper() + word[1:] for word in words) or "Module"
+    base = _pascal_name(stem)
     return f"{base}Service"
+
+
+def _pascal_name(value: str) -> str:
+    words = [word for word in value.replace("-", "_").split("_") if word]
+    return "".join(word[:1].upper() + word[1:] for word in words) or "Module"
 
 
 def _default_instance_name(class_name: str) -> str:

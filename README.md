@@ -9,6 +9,7 @@
 ## What it does
 
 - Sets the project paradigm with `paradigm OOP`, then applies the configured rewrite across the project.
+- Creates layered/domain architecture boundaries with `paradigm layered`.
 - Runs the configured paradigm linter with `run`.
 - Ignores a folder with `ignore --path path/to/folder`, which writes a `.msignore` file there.
 - Splits one top-level function with `splitfunc`.
@@ -31,6 +32,7 @@ ManaSplice is intended to work like a paradigm linter: the configured paradigm i
 - rewriting calls between selected functions to `self.method(...)`;
 - inferring constructor parameters from module-level state read by those functions;
 - rewriting those state reads to `self.<attribute>`;
+- inferring record-style owner classes from functions such as `cart_add_item(cart, item)` and rewriting dictionary-field access such as `cart["items"]` to `self.items`;
 - leaving top-level function wrappers that call a generated default instance for compatibility.
 
 This is still conservative. ManaSplice skips decorated functions, overloads, dynamic code execution, eager module-initialization references, and functions using `global` statements. The current semantic mode does not yet infer rich domain object boundaries, inheritance/composition, layered architecture, pure immutable functional pipelines, domain events, event buses, bounded contexts, services, repositories, or controllers.
@@ -39,12 +41,17 @@ This is still conservative. ManaSplice skips decorated functions, overloads, dyn
 
 ```bash
 manasplice paradigm OOP
+manasplice paradigm layered
 manasplice run
 manasplice run --check
 manasplice ignore --path legacy
 ```
 
-`paradigm OOP` writes `[tool.manasplice]` settings to `pyproject.toml` and applies the OOP rule across the project. `run` reuses that configured target. `run --check` reports what would change without writing files. A `.msignore` file makes ManaSplice skip that folder and everything below it.
+`paradigm OOP` writes `[tool.manasplice]` settings to `pyproject.toml` and applies the OOP rule across the project. `paradigm layered` writes the layered target and creates bounded-context scaffolding under `contexts/` plus shared `event_bus.py` and `pipeline.py` primitives. `run` reuses the configured target. `run --check` reports what would change without writing files. A `.msignore` file makes ManaSplice skip that folder and everything below it.
+
+The layered target generates explicit places for rich domain entities, aggregate inheritance, service composition, repositories, controllers, domain events, an event bus, immutable pipeline composition, and bounded contexts. It is an enforcement scaffold today; migrating arbitrary existing code into those layers is still incremental.
+
+Layered mode also lints architecture drift. It reports domain/application/infrastructure/presentation dependency-direction violations, rejects cross-context imports between bounded contexts, and keeps shared code independent from contexts. Application services depend on repository ports, while infrastructure provides repository implementations.
 
 >[!WARNING]
 This project is very early in development. It is meant to simplify mechanical restructuring tasks, but ManaSplice can still touch large parts of a codebase.

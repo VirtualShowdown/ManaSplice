@@ -13,6 +13,7 @@ from pathlib import Path
 from colorama import Fore, Style, just_fix_windows_console
 
 from .analysis import iter_assigned_names, iter_imported_names, statement_start_lineno
+from .architecture import ArchitectureOptions, infer_layered_context_names, transform_project_to_layered_architecture
 from .config import load_project_config, update_project_config
 from .dependencies import collect_dependency_names, collect_required_import_names, render_dependency_blocks
 from .exceptions import PySplitError
@@ -270,12 +271,13 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
         help="Apply paradigm transforms, including mechanical facades and semantic OOP.",
         description=(
             "Apply paradigm transforms. OOP defaults to a mechanical static wrapper; use --semantic "
-            "to infer an instance-oriented class from compatible procedural modules."
+            "to infer an instance-oriented class. Layered creates domain/application/infrastructure/"
+            "presentation boundaries."
         ),
     )
     paradigm.add_argument(
         "style",
-        help="Target paradigm. Supported: OOP, functional, event-driven, procedural.",
+        help="Target paradigm. Supported: OOP, functional, event-driven, procedural, layered.",
     )
     paradigm.add_argument(
         "path",
@@ -493,48 +495,56 @@ def main(argv: list[str] | None = None) -> int:
             _preflight_git_commit(cwd, args.git_commit)
             style = _normalize_paradigm_style(args.style)
             if not args.path and not args.directory:
+                inferred_contexts = (
+                    (infer_layered_context_names(cwd) or ["core"]) if _is_architecture_style(style) else []
+                )
                 config_path = update_project_config(
                     cwd,
                     {
                         "target_paradigm": style,
                         "semantic_oop": style == "OOP",
+                        "contexts": inferred_contexts,
                         "recursive": True,
                         "validate": True,
                     },
                 )
+                config = {**config, "contexts": inferred_contexts}
                 args.semantic = args.semantic or style == "OOP"
                 args.validate = True
                 if not args.json:
                     print(f"Set default paradigm to {style}: {config_path}")
-            paradigm_results = _handle_paradigm(args, cwd)
+            paradigm_results = _handle_paradigm_or_architecture(args, cwd, config)
             if not args.preview and not args.audit:
                 _format_file_changes(_paradigm_file_changes(paradigm_results), _normalize_format_tool(args.format))
             changed_count = sum(len(result.function_names) for result in paradigm_results)
             skipped_count = sum(len(result.skipped) for result in paradigm_results)
-            json_payload = {
+            changes = _paradigm_file_changes(paradigm_results)
+            normalized_style = _normalize_paradigm_style(args.style)
+            paradigm_json_payload: dict[str, object] = {
                 "status": "ok",
                 "mode": "audit" if args.audit else "preview" if args.preview else "apply",
-                "style": args.style,
+                "style": normalized_style,
                 "count": changed_count,
                 "skipped_count": skipped_count,
                 "results": [_paradigm_result_to_json(result) for result in paradigm_results],
             }
             if not args.json:
-                action = "Audit found" if args.audit else "Would restructure" if args.preview else "Restructured"
-                print(f"{action} {changed_count} function(s) for {_normalize_paradigm_style(args.style)}.")
+                action = _paradigm_summary_action(style=normalized_style, audit=args.audit, preview=args.preview)
+                print(f"{action} {changed_count} {_paradigm_item_label(normalized_style)}(s) for {normalized_style}.")
+                if _is_architecture_style(normalized_style):
+                    print(f"{len(changes)} file change(s) needed.")
                 if args.audit:
                     print(f"Skipped {skipped_count} function(s) with safety reasons.")
-                    _print_paradigm_audit_guidance(_normalize_paradigm_style(args.style), len(paradigm_results))
-            if changed_count and not args.preview and not args.audit:
-                changes = _paradigm_file_changes(paradigm_results)
-                command = f"manasplice paradigm {_normalize_paradigm_style(args.style)}"
+                    _print_paradigm_audit_guidance(normalized_style, len(paradigm_results))
+            if changes and not args.preview and not args.audit:
+                command = f"manasplice paradigm {normalized_style}"
                 history_file = record_change_history(cwd, command, changes)
                 if not args.json:
                     print(f"Recorded rollback history: {history_file}")
                 _run_verification_commands(cwd, args.verify_command, emit_output=not args.json)
                 _git_commit_changes(cwd, args.git_commit, command, changes)
             if args.json:
-                _print_json(json_payload)
+                _print_json(paradigm_json_payload)
             return 0
         if args.command == "run":
             cwd = Path(args.cwd)
@@ -542,12 +552,13 @@ def main(argv: list[str] | None = None) -> int:
             _preflight_git_commit(cwd, args.git_commit)
             style = _configured_paradigm(config)
             run_args = _build_run_paradigm_args(args, cwd, config, style)
-            paradigm_results = _handle_paradigm(run_args, cwd)
+            paradigm_results = _handle_paradigm_or_architecture(run_args, cwd, config)
             if not run_args.preview and not run_args.audit:
                 _format_file_changes(_paradigm_file_changes(paradigm_results), _normalize_format_tool(args.format))
             changed_count = sum(len(result.function_names) for result in paradigm_results)
             skipped_count = sum(len(result.skipped) for result in paradigm_results)
-            json_payload = {
+            changes = _paradigm_file_changes(paradigm_results)
+            run_json_payload: dict[str, object] = {
                 "status": "ok",
                 "mode": "check" if args.check else "preview" if args.preview else "apply",
                 "style": style,
@@ -556,19 +567,20 @@ def main(argv: list[str] | None = None) -> int:
                 "results": [_paradigm_result_to_json(result) for result in paradigm_results],
             }
             if not args.json:
-                action = "Check found" if args.check else "Would restructure" if args.preview else "Restructured"
-                print(f"{action} {changed_count} function(s) for {style}.")
+                action = _paradigm_summary_action(style=style, check=args.check, preview=args.preview)
+                print(f"{action} {changed_count} {_paradigm_item_label(style)}(s) for {style}.")
+                if _is_architecture_style(style):
+                    print(f"{len(changes)} file change(s) needed.")
                 if args.check:
                     print(f"Skipped {skipped_count} function(s) with safety reasons.")
-            if changed_count and not args.preview and not args.check:
-                changes = _paradigm_file_changes(paradigm_results)
+            if changes and not args.preview and not args.check:
                 command = "manasplice run"
                 history_file = record_change_history(cwd, command, changes)
                 if not args.json:
                     print(f"Recorded rollback history: {history_file}")
                 _git_commit_changes(cwd, args.git_commit, command, changes)
             if args.json:
-                _print_json(json_payload)
+                _print_json(run_json_payload)
             return 0
         if args.command == "ignore":
             ignore_file = _write_ignore_file(Path(args.cwd), args.path)
@@ -734,6 +746,38 @@ def _handle_paradigm(args: argparse.Namespace, cwd: Path) -> list[ParadigmResult
     return results
 
 
+def _handle_paradigm_or_architecture(args: argparse.Namespace, cwd: Path, config: dict) -> list[ParadigmResult]:
+    style = _normalize_paradigm_style(args.style)
+    if _is_architecture_style(style):
+        if args.class_name:
+            raise PySplitError("--class-name is only supported for file-level OOP transforms.")
+        if args.path and _looks_like_file_path(args.path):
+            raise PySplitError("Layered architecture enforcement works at project or directory scope, not one file.")
+        contexts = _parse_contexts(config.get("contexts"))
+        target_root = _architecture_target_root(args, cwd)
+        results = transform_project_to_layered_architecture(
+            target_root,
+            options=ArchitectureOptions(
+                preview=args.preview or args.audit,
+                validate=args.validate,
+                contexts=contexts,
+            ),
+        )
+        if not args.json:
+            for result in results:
+                _print_paradigm_result(result, style=style, show_diffs=args.preview and not args.audit)
+        return results
+    return _handle_paradigm(args, cwd)
+
+
+def _architecture_target_root(args: argparse.Namespace, cwd: Path) -> Path:
+    if args.path:
+        return (cwd / args.path).resolve()
+    if args.directory:
+        return (cwd / args.directory).resolve()
+    return cwd
+
+
 def _configured_paradigm(config: dict) -> str:
     raw_style = config.get("target_paradigm") or config.get("paradigm")
     if not raw_style:
@@ -762,6 +806,7 @@ def _build_run_paradigm_args(
         public_only=args.public_only,
         allow_broad_facade=args.allow_broad_facade,
         semantic=style == "OOP" and bool(config.get("semantic_oop", True)),
+        contexts=config.get("contexts"),
         json=args.json,
     )
 
@@ -789,11 +834,49 @@ def _normalize_paradigm_style(raw_style: str) -> str:
         "events": "event-driven",
         "proc": "procedural",
         "imperative": "procedural",
+        "architecture": "layered",
+        "layers": "layered",
+        "clean": "layered",
+        "clean-architecture": "layered",
+        "domain": "layered",
+        "ddd": "layered",
     }
     normalized = aliases.get(normalized, normalized)
-    if normalized not in {"oop", "functional", "event-driven", "procedural"}:
-        raise PySplitError("Unsupported paradigm. Supported: OOP, functional, event-driven, procedural.")
+    if normalized not in {"oop", "functional", "event-driven", "procedural", "layered"}:
+        raise PySplitError("Unsupported paradigm. Supported: OOP, functional, event-driven, procedural, layered.")
     return "OOP" if normalized == "oop" else normalized
+
+
+def _is_architecture_style(style: str) -> bool:
+    return style == "layered"
+
+
+def _paradigm_item_label(style: str) -> str:
+    return "context" if _is_architecture_style(style) else "function"
+
+
+def _paradigm_summary_action(
+    *,
+    style: str,
+    audit: bool = False,
+    check: bool = False,
+    preview: bool = False,
+) -> str:
+    if audit:
+        return "Audited" if _is_architecture_style(style) else "Audit found"
+    if check:
+        return "Checked" if _is_architecture_style(style) else "Check found"
+    return "Would restructure" if preview else "Restructured"
+
+
+def _parse_contexts(raw_contexts: object) -> list[str] | None:
+    if raw_contexts is None:
+        return None
+    if isinstance(raw_contexts, list):
+        return [str(context).strip() for context in raw_contexts if str(context).strip()]
+    if isinstance(raw_contexts, str):
+        return [context.strip() for context in raw_contexts.split(",") if context.strip()]
+    return None
 
 
 def _transform_module_for_style(
@@ -813,7 +896,7 @@ def _transform_module_for_style(
         return transform_module_to_event_driven(file_path, options=options)
     if style == "procedural":
         return transform_module_to_procedural(file_path, options=options)
-    raise PySplitError("Unsupported paradigm. Supported: OOP, functional, event-driven, procedural.")
+    raise PySplitError("Unsupported paradigm. Supported: OOP, functional, event-driven, procedural, layered.")
 
 
 def _resolve_paradigm_files(
@@ -1112,6 +1195,8 @@ def _print_paradigm_result(result: ParadigmResult, *, style: str, show_diffs: bo
         return
 
     action = "Would restructure" if result.preview else "Restructured"
+    if _is_architecture_style(style) and result.preview and not result.file_changes and not result.skipped:
+        action = "Checked"
     verb = _color_text(action, Fore.CYAN if result.preview else Fore.GREEN)
     names_str = _color_text(", ".join(result.function_names), Fore.MAGENTA)
     print(f"{verb} {result.module_file} for {style} via {result.class_name}: {names_str}")
