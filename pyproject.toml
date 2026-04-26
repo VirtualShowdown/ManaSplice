@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "manasplice"
-version = "0.1.2"
-description = "Split top-level Python functions into dedicated modules and rewire imports automatically."
+version = "0.1.3a1"
+description = "Python restructuring for splitting functions, generated facades, and early semantic OOP conversion."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "VirtualShowdown" }]

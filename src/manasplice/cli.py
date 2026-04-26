@@ -13,7 +13,7 @@ from pathlib import Path
 from colorama import Fore, Style, just_fix_windows_console
 
 from .analysis import iter_assigned_names, iter_imported_names, statement_start_lineno
-from .config import load_project_config
+from .config import load_project_config, update_project_config
 from .dependencies import collect_dependency_names, collect_required_import_names, render_dependency_blocks
 from .exceptions import PySplitError
 from .history import record_change_history, record_split_history, rollback_last
@@ -35,6 +35,7 @@ from .rewrite import (
     transform_function_block,
     updated_package_exports,
 )
+from .semantic_oop import transform_module_to_semantic_oop
 from .splitter import (
     FileChange,
     GroupSplitResult,
@@ -53,7 +54,7 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     config = config or {}
     parser = argparse.ArgumentParser(
         prog="manasplice",
-        description="Split a top-level Python function into its own module and rewrite imports.",
+        description="Lint and restructure Python projects toward a configured paradigm.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -264,7 +265,14 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     splitmethod.add_argument("--require-clean-git", action="store_true")
     splitmethod.add_argument("--git-commit", action="store_true")
 
-    paradigm = subparsers.add_parser("paradigm", help="Restructure Python modules toward a programming paradigm.")
+    paradigm = subparsers.add_parser(
+        "paradigm",
+        help="Apply paradigm transforms, including mechanical facades and semantic OOP.",
+        description=(
+            "Apply paradigm transforms. OOP defaults to a mechanical static wrapper; use --semantic "
+            "to infer an instance-oriented class from compatible procedural modules."
+        ),
+    )
     paradigm.add_argument(
         "style",
         help="Target paradigm. Supported: OOP, functional, event-driven, procedural.",
@@ -272,9 +280,9 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     paradigm.add_argument(
         "path",
         nargs="?",
-        help="Python file to restructure. Defaults to the current project directory.",
+        help="Python file to transform. Defaults to the current project directory.",
     )
-    paradigm.add_argument("--dir", dest="directory", help="Directory whose Python files should be restructured.")
+    paradigm.add_argument("--dir", dest="directory", help="Directory whose Python files should be transformed.")
     paradigm.add_argument("--cwd", default=".", help="Project root to resolve from. Defaults to current directory.")
     paradigm.add_argument(
         "--audit",
@@ -287,11 +295,19 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     paradigm.add_argument("--class-name", help="Class name to use when restructuring a single file.")
     paradigm.add_argument("--include", help="Comma-separated function name patterns to include, like 'run_*'.")
     paradigm.add_argument("--exclude", help="Comma-separated function name patterns to exclude, like 'main,_*'.")
-    paradigm.add_argument("--public-only", action="store_true", help="Only restructure public top-level functions.")
+    paradigm.add_argument("--public-only", action="store_true", help="Only transform public top-level functions.")
     paradigm.add_argument(
         "--allow-broad-facade",
         action="store_true",
         help="Allow functional/event facades across multiple files. Prefer audit or explicit includes first.",
+    )
+    paradigm.add_argument(
+        "--semantic",
+        action="store_true",
+        help=(
+            "For OOP, infer an instance-oriented class with instance methods and constructor state "
+            "instead of generating static wrappers."
+        ),
     )
     paradigm.add_argument(
         "--verify-command",
@@ -303,6 +319,31 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
     paradigm.add_argument("--format", nargs="?", const="ruff", default=config.get("format", None))
     paradigm.add_argument("--require-clean-git", action="store_true")
     paradigm.add_argument("--git-commit", action="store_true")
+
+    run = subparsers.add_parser(
+        "run",
+        help="Enforce the configured project paradigm.",
+        description="Run ManaSplice as a paradigm linter using [tool.manasplice].target_paradigm.",
+    )
+    run.add_argument("path", nargs="?", help="Optional Python file or directory to enforce.")
+    run.add_argument("--dir", dest="directory", help="Directory whose Python files should be enforced.")
+    run.add_argument("--cwd", default=".", help="Project root to resolve from. Defaults to current directory.")
+    run.add_argument("--preview", action="store_true", help="Show planned changes without writing files.")
+    run.add_argument("--check", action="store_true", help="Report deviations without writing files.")
+    run.add_argument("--validate", action="store_true", default=config.get("validate", False))
+    run.add_argument("--recursive", action="store_true", default=config.get("recursive", True))
+    run.add_argument("--include", default=config.get("include"))
+    run.add_argument("--exclude", default=config.get("exclude"))
+    run.add_argument("--public-only", action="store_true", default=config.get("public_only", False))
+    run.add_argument("--allow-broad-facade", action="store_true", default=config.get("allow_broad_facade", False))
+    run.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    run.add_argument("--format", nargs="?", const="ruff", default=config.get("format", None))
+    run.add_argument("--require-clean-git", action="store_true")
+    run.add_argument("--git-commit", action="store_true")
+
+    ignore = subparsers.add_parser("ignore", help="Ignore paradigm deviations for a path.")
+    ignore.add_argument("--path", default=".", help="Folder to mark ignored with a .msignore file.")
+    ignore.add_argument("--cwd", default=".", help="Project root to resolve from. Defaults to current directory.")
 
     undo = subparsers.add_parser(
         "undo",
@@ -333,12 +374,7 @@ def build_parser(config: dict | None = None) -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Quick pre-parse to locate --cwd before loading the project config.
-    _pre = argparse.ArgumentParser(add_help=False)
-    _pre.add_argument("--cwd", default=".")
-    pre_args, _ = _pre.parse_known_args(argv)
-
-    config = load_project_config(Path(pre_args.cwd))
+    config = load_project_config(Path(_preparse_cwd(argv)))
     parser = build_parser(config)
     args = parser.parse_args(argv)
 
@@ -455,6 +491,21 @@ def main(argv: list[str] | None = None) -> int:
             cwd = Path(args.cwd)
             _require_clean_git(cwd, args.require_clean_git)
             _preflight_git_commit(cwd, args.git_commit)
+            style = _normalize_paradigm_style(args.style)
+            if not args.path and not args.directory:
+                config_path = update_project_config(
+                    cwd,
+                    {
+                        "target_paradigm": style,
+                        "semantic_oop": style == "OOP",
+                        "recursive": True,
+                        "validate": True,
+                    },
+                )
+                args.semantic = args.semantic or style == "OOP"
+                args.validate = True
+                if not args.json:
+                    print(f"Set default paradigm to {style}: {config_path}")
             paradigm_results = _handle_paradigm(args, cwd)
             if not args.preview and not args.audit:
                 _format_file_changes(_paradigm_file_changes(paradigm_results), _normalize_format_tool(args.format))
@@ -485,6 +536,45 @@ def main(argv: list[str] | None = None) -> int:
             if args.json:
                 _print_json(json_payload)
             return 0
+        if args.command == "run":
+            cwd = Path(args.cwd)
+            _require_clean_git(cwd, args.require_clean_git)
+            _preflight_git_commit(cwd, args.git_commit)
+            style = _configured_paradigm(config)
+            run_args = _build_run_paradigm_args(args, cwd, config, style)
+            paradigm_results = _handle_paradigm(run_args, cwd)
+            if not run_args.preview and not run_args.audit:
+                _format_file_changes(_paradigm_file_changes(paradigm_results), _normalize_format_tool(args.format))
+            changed_count = sum(len(result.function_names) for result in paradigm_results)
+            skipped_count = sum(len(result.skipped) for result in paradigm_results)
+            json_payload = {
+                "status": "ok",
+                "mode": "check" if args.check else "preview" if args.preview else "apply",
+                "style": style,
+                "count": changed_count,
+                "skipped_count": skipped_count,
+                "results": [_paradigm_result_to_json(result) for result in paradigm_results],
+            }
+            if not args.json:
+                action = "Check found" if args.check else "Would restructure" if args.preview else "Restructured"
+                print(f"{action} {changed_count} function(s) for {style}.")
+                if args.check:
+                    print(f"Skipped {skipped_count} function(s) with safety reasons.")
+            if changed_count and not args.preview and not args.check:
+                changes = _paradigm_file_changes(paradigm_results)
+                command = "manasplice run"
+                history_file = record_change_history(cwd, command, changes)
+                if not args.json:
+                    print(f"Recorded rollback history: {history_file}")
+                _git_commit_changes(cwd, args.git_commit, command, changes)
+            if args.json:
+                _print_json(json_payload)
+            return 0
+        if args.command == "ignore":
+            ignore_file = _write_ignore_file(Path(args.cwd), args.path)
+            print(f"Ignoring ManaSplice paradigm deviations under: {ignore_file.parent}")
+            print(f"Wrote: {ignore_file}")
+            return 0
         if args.command == "undo":
             undo_count, history_file = rollback_last(Path(args.cwd), args.count)
             print(f"Rolled back {undo_count} operation(s).")
@@ -501,6 +591,16 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.print_help()
     return 1
+
+
+def _preparse_cwd(argv: list[str] | None) -> str:
+    values = sys.argv[1:] if argv is None else argv
+    for index, value in enumerate(values):
+        if value == "--cwd" and index + 1 < len(values):
+            return values[index + 1]
+        if value.startswith("--cwd="):
+            return value.split("=", 1)[1]
+    return "."
 
 
 def _split_all(
@@ -602,6 +702,8 @@ def _handle_paradigm(args: argparse.Namespace, cwd: Path) -> list[ParadigmResult
     style = _normalize_paradigm_style(args.style)
     if args.class_name and (args.directory or not args.path or args.recursive):
         raise PySplitError("--class-name can only be used with one explicit Python file.")
+    if args.semantic and style != "OOP":
+        raise PySplitError("--semantic is currently only supported with paradigm OOP.")
 
     target_files = _resolve_paradigm_files(args.path, args.directory, cwd, recursive=args.recursive)
     if (
@@ -625,11 +727,54 @@ def _handle_paradigm(args: argparse.Namespace, cwd: Path) -> list[ParadigmResult
             exclude_patterns=_parse_patterns(args.exclude),
             public_only=args.public_only,
         )
-        result = _transform_module_for_style(file_path, style, options)
+        result = _transform_module_for_style(file_path, style, options, semantic=args.semantic)
         results.append(result)
         if not args.json:
             _print_paradigm_result(result, style=style, show_diffs=args.preview and not args.audit)
     return results
+
+
+def _configured_paradigm(config: dict) -> str:
+    raw_style = config.get("target_paradigm") or config.get("paradigm")
+    if not raw_style:
+        raise PySplitError("No target paradigm configured. Run 'manasplice paradigm OOP' first.")
+    return _normalize_paradigm_style(str(raw_style))
+
+
+def _build_run_paradigm_args(
+    args: argparse.Namespace,
+    cwd: Path,
+    config: dict,
+    style: str,
+) -> argparse.Namespace:
+    path, directory = _resolve_run_target(args.path, args.directory, cwd)
+    return argparse.Namespace(
+        style=style,
+        path=path,
+        directory=directory,
+        audit=args.check,
+        preview=args.preview,
+        validate=args.validate or bool(config.get("validate", False)),
+        recursive=args.recursive or bool(config.get("recursive", True)),
+        class_name=None,
+        include=args.include,
+        exclude=args.exclude,
+        public_only=args.public_only,
+        allow_broad_facade=args.allow_broad_facade,
+        semantic=style == "OOP" and bool(config.get("semantic_oop", True)),
+        json=args.json,
+    )
+
+
+def _resolve_run_target(path_arg: str | None, directory_arg: str | None, cwd: Path) -> tuple[str | None, str | None]:
+    if path_arg and directory_arg:
+        raise PySplitError("run requires either a path or --dir, but not both.")
+    if not path_arg:
+        return None, directory_arg
+    target = (cwd / path_arg).resolve()
+    if target.exists() and target.is_dir():
+        return None, path_arg
+    return path_arg, None
 
 
 def _normalize_paradigm_style(raw_style: str) -> str:
@@ -651,8 +796,16 @@ def _normalize_paradigm_style(raw_style: str) -> str:
     return "OOP" if normalized == "oop" else normalized
 
 
-def _transform_module_for_style(file_path: Path, style: str, options: ParadigmOptions) -> ParadigmResult:
+def _transform_module_for_style(
+    file_path: Path,
+    style: str,
+    options: ParadigmOptions,
+    *,
+    semantic: bool = False,
+) -> ParadigmResult:
     if style == "OOP":
+        if semantic:
+            return transform_module_to_semantic_oop(file_path, options=options)
         return transform_module_to_oop(file_path, options=options)
     if style == "functional":
         return transform_module_to_functional(file_path, options=options)
@@ -679,6 +832,8 @@ def _resolve_paradigm_files(
             raise PySplitError(f"File not found: {file_path}")
         if file_path.suffix != ".py":
             raise PySplitError(f"paradigm only supports Python files: {file_path}")
+        if _is_under_msignore(file_path, cwd.resolve()):
+            return []
         return [file_path]
 
     directory = (cwd / directory_arg).resolve() if directory_arg else cwd.resolve()
@@ -703,7 +858,28 @@ def _is_restructurable_python_file(file_path: Path, root: Path) -> bool:
         "build",
         "dist",
     }
-    return not ignored_parts.intersection(file_path.relative_to(root).parts)
+    return not ignored_parts.intersection(file_path.relative_to(root).parts) and not _is_under_msignore(file_path, root)
+
+
+def _is_under_msignore(file_path: Path, root: Path) -> bool:
+    current = file_path.parent.resolve()
+    root = root.resolve()
+    while True:
+        if (current / ".msignore").exists():
+            return True
+        if current == root or current.parent == current:
+            return False
+        current = current.parent
+
+
+def _write_ignore_file(cwd: Path, raw_path: str) -> Path:
+    target = (cwd / raw_path).resolve()
+    ignore_dir = target.parent if target.exists() and target.is_file() else target
+    ignore_dir.mkdir(parents=True, exist_ok=True)
+    ignore_file = ignore_dir / ".msignore"
+    if not ignore_file.exists():
+        ignore_file.write_text("# ManaSplice ignores paradigm deviations below this folder.\n", encoding="utf-8")
+    return ignore_file
 
 
 def _resolve_splitall_files(
@@ -931,6 +1107,8 @@ def _print_paradigm_result(result: ParadigmResult, *, style: str, show_diffs: bo
     if not result.function_names:
         if result.skipped:
             print(f"Skipped {result.module_file}: no safe top-level functions to restructure.")
+            for function_name, reason in result.skipped.items():
+                print(f"Skipped {function_name}: {reason}.")
         return
 
     action = "Would restructure" if result.preview else "Restructured"
@@ -1215,6 +1393,8 @@ def _handle_config(args: argparse.Namespace) -> int:
     if args.config_command == "init":
         block = (
             "\n[tool.manasplice]\n"
+            'target_paradigm = "OOP"\n'
+            "semantic_oop = true\n"
             'output_package = "modules"\n'
             "validate = true\n"
             "public_only = true\n"

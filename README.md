@@ -2,22 +2,52 @@
 
  # ManaSplice
 
- ManaSplice is a small CLI for pulling top-level Python functions into their own files without leaving the original module broken.
+ ManaSplice is a small paradigm linter for Python restructuring. It can configure a target paradigm for a project, scan for code that can move toward that paradigm, apply safe rewrites, and ignore folders that should stay outside the rule.
 
  It creates a `modules/` package next to the source file, moves the function there, and rewrites the source module to import it back in.
 
 ## What it does
 
+- Sets the project paradigm with `paradigm OOP`, then applies the configured rewrite across the project.
+- Runs the configured paradigm linter with `run`.
+- Ignores a folder with `ignore --path path/to/folder`, which writes a `.msignore` file there.
 - Splits one top-level function with `splitfunc`.
 - Splits every top-level function in a file, or every top-level function in each Python file in a directory, with `splitall`.
-- Restructures modules toward a simple OOP shape with `paradigm OOP`.
+- Adds a generated static-method namespace plus top-level forwarding wrappers with `paradigm OOP <file>`.
+- Starts a semantic procedural-to-OOP conversion with project-level `paradigm OOP` or explicit `paradigm OOP --semantic`, which creates an instantiable class, converts selected functions into instance methods, infers constructor state from module-level values used by those functions, and keeps compatibility wrappers through a default instance.
+- Adds functional convenience helpers and a `FUNCTIONAL_API` mapping with `paradigm functional`.
+- Adds an event dispatch facade with `paradigm event-driven`.
+- Reverses ManaSplice-generated static OOP wrappers back toward procedural code with `paradigm procedural`.
 - Checks whether a split is safe, and shows the planned changes without writing files, with `check`.
 - Emits JSON plans with `--json` for automation.
 - Copies the imports and top-level definitions the extracted function needs.
 - Maintains `modules/__init__.py` so rewritten files can use a single merged import line.
 
+## Semantic paradigm work
+
+ManaSplice is intended to work like a paradigm linter: the configured paradigm is the standard, and `manasplice run` scans code for safe rewrites toward that standard. The first semantic path is OOP. It can convert compatible procedural modules into an instance-oriented class by:
+
+- turning selected top-level functions into instance methods;
+- rewriting calls between selected functions to `self.method(...)`;
+- inferring constructor parameters from module-level state read by those functions;
+- rewriting those state reads to `self.<attribute>`;
+- leaving top-level function wrappers that call a generated default instance for compatibility.
+
+This is still conservative. ManaSplice skips decorated functions, overloads, dynamic code execution, eager module-initialization references, and functions using `global` statements. The current semantic mode does not yet infer rich domain object boundaries, inheritance/composition, layered architecture, pure immutable functional pipelines, domain events, event buses, bounded contexts, services, repositories, or controllers.
+
+## Paradigm linter workflow
+
+```bash
+manasplice paradigm OOP
+manasplice run
+manasplice run --check
+manasplice ignore --path legacy
+```
+
+`paradigm OOP` writes `[tool.manasplice]` settings to `pyproject.toml` and applies the OOP rule across the project. `run` reuses that configured target. `run --check` reports what would change without writing files. A `.msignore` file makes ManaSplice skip that folder and everything below it.
+
 >[!WARNING]
-This project is very early in development. It is meant to truly enhance the user experience by simplifying the way you structure the code in a project. This means ManaSplice can touch huge parts of code and try to convert them in the way you tell it to. 
+This project is very early in development. It is meant to simplify mechanical restructuring tasks, but ManaSplice can still touch large parts of a codebase.
 
 >[!CAUTION]
 Although there are measures to prevent issues, please be sure to use git and commit before using ManaSplice to prevent potentially unexpected behavior.
